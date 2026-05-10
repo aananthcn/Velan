@@ -1,0 +1,7 @@
+venv/
+models/
+build/
+test/gen/
+
+*.wav
+*.deb
