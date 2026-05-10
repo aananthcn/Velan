@@ -1,4 +1,4 @@
-# Velan (C++)
+# Velan (C++), the AI Assistant for Automotive
 
 A local Automotive assistant that recognises drivers, listens to voice commands, transcribes it with [whisper.cpp](https://github.com/ggerganov/whisper.cpp), and sends the text to a local LLM via [Ollama](https://ollama.com). No cloud APIs, no Python runtime required at execution time.
 
