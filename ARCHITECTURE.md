@@ -47,7 +47,10 @@ vehicle property change events. It does not expose any server port of its own.
                                                Ollama  (LLM)
                                                         │
                                                         ▼
-                                                  Terminal output
+                                               Piper   (TTS)
+                                                        │
+                                                        ▼
+                                               PortAudio speaker output
 ```
 
 ---
@@ -106,6 +109,7 @@ Velan start-up
             (TRIGGER_OFF)          transcribe (whisper.cpp)
                                    query LLM  (Ollama REST API)
                                    print reply
+                                   speak reply (Piper TTS → PortAudio)
 ```
 
 On SIGINT, SIGTERM, or SIGABRT the poll loop exits within one tick (≤ 100 ms)
@@ -137,3 +141,68 @@ trigger_velan.py  ──SetValues──▶  VHAL core  ──stream──▶  Ve
 | `trigger_velan.py` | Test-only trigger client | Development host |
 | Ollama | LLM REST server | Same host as Velan |
 | whisper.cpp | STT library | Linked into Velan binary |
+| Piper | TTS subprocess | Installed on same host |
+
+---
+
+## Source Structure
+
+```
+src/
+├── main.cpp                      VHAL gRPC polling loop, CLI, signal handling
+├── Speech2TextManager.h/.cpp     Singleton: PortAudio capture + Whisper STT
+├── TransformerManager.h/.cpp     Ollama conversation history + HTTP chat
+└── Text2SpeechManager.h/.cpp     Piper TTS subprocess + PortAudio playback
+
+scripts/
+├── build.sh                      Configure + parallel build (Ninja, --cuda flag)
+└── download_models.sh            Download Whisper and Piper voice models
+
+models/
+├── stt/
+│   └── ggml-medium.bin           Whisper medium model (downloaded by script)
+└── tts/
+    ├── en_US-lessac-medium.onnx       Piper voice model (downloaded by script)
+    └── en_US-lessac-medium.onnx.json  Piper voice config (downloaded by script)
+
+~/.local/                         User-local install (outside the project tree)
+├── bin/piper                     Wrapper script — sets LD_LIBRARY_PATH, execs real binary
+└── lib/piper/                    Piper real binary + bundled shared libs
+```
+
+### Class responsibilities
+
+**`Speech2TextManager`** (singleton) owns the speech-input pipeline:
+- Constructor initialises PortAudio and loads the Whisper model; throws on failure
+- Destructor joins any active recording thread, frees Whisper context, terminates PortAudio
+- Spawns and tears down the recording thread on VHAL trigger events (`handle_trigger`)
+- Transcribes captured PCM via whisper.cpp, queries the LLM, and speaks the reply (`process`, private)
+- Owns `TransformerManager` and `Text2SpeechManager` by value
+
+**`TransformerManager`** owns the LLM interaction:
+- Holds the Ollama model name and the full multi-turn conversation `history`
+- Seeds the conversation with the Velan system prompt on construction
+- Sends each transcript to the Ollama REST API and appends both user and assistant turns to history (`chat`)
+
+**`Text2SpeechManager`** owns the speech-output pipeline:
+- Constructor verifies the Piper voice model file is present; throws with download instructions if not
+- `speak()` forks a `piper` subprocess, writes text to its stdin, reads back raw 16-bit PCM from stdout, and plays it via PortAudio at 22050 Hz
+
+### Naming rationale
+
+`Speech2TextManager` and `Text2SpeechManager` name the direction of conversion explicitly, making the pipeline readable left-to-right. `TransformerManager` reflects that the class drives a transformer-based LLM, keeping HTTP and history logic separate from audio concerns.
+
+### Composition and call chain
+
+`Speech2TextManager` owns `TransformerManager` and `Text2SpeechManager` by value. The full pipeline on TRIGGER_OFF:
+
+```
+Speech2TextManager::handle_trigger(0)
+  └─ Speech2TextManager::process()
+       ├─ transcribe()               (whisper.cpp, file-local)
+       ├─ TransformerManager::chat()
+       │    └─ Ollama REST API       (libcurl, file-local)
+       └─ Text2SpeechManager::speak()
+            ├─ fork + exec piper
+            └─ PortAudio output stream
+```

@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.18)
 project(velan CXX)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -187,7 +189,12 @@ target_link_libraries(velan_proto PUBLIC
 # ---------------------------------------------------------------------------
 # Target
 # ---------------------------------------------------------------------------
-add_executable(velan src/main.cpp)
+add_executable(velan
+    src/main.cpp
+    src/Speech2TextManager.cpp
+    src/TransformerManager.cpp
+    src/Text2SpeechManager.cpp
+)
 
 target_include_directories(velan PRIVATE
     ${whisper_SOURCE_DIR}

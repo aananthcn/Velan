@@ -5,3 +5,5 @@ test/gen/
 
 *.wav
 *.deb
+.aider*
+.vscode/

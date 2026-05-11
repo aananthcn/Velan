@@ -1,15 +1,27 @@
 # Velan (C++), the AI Assistant for Automotive
 
-A local Automotive assistant that recognises drivers, listens to voice commands, transcribes it with [whisper.cpp](https://github.com/ggerganov/whisper.cpp), and sends the text to a local LLM via [Ollama](https://ollama.com). No cloud APIs, no Python runtime required at execution time.
+A local automotive voice assistant that listens to voice commands, transcribes
+them with [whisper.cpp](https://github.com/ggerganov/whisper.cpp), sends the
+text to a local LLM via [Ollama](https://ollama.com), and speaks the reply
+aloud using [Piper](https://github.com/rhasspy/piper) TTS. No cloud APIs, no
+Python runtime required at execution time.
 
-Developed on a **PC with Nvidia GPU** (RTX 5070), then deployed to **Raspberry Pi 5** with the [Raspberry Pi AI HAT+](https://www.raspberrypi.com/products/ai-hat/) (Hailo-8L, 13 TOPS). Builds on any Linux x86-64 or AArch64 machine.
+Developed on a **PC with Nvidia GPU** (RTX 5070), then deployed to
+**Raspberry Pi 5** with the
+[Raspberry Pi AI HAT+](https://www.raspberrypi.com/products/ai-hat/)
+(Hailo-8L, 13 TOPS). Builds on any Linux x86-64 or AArch64 machine.
 
 ---
 
 ## Pipeline
 
 ```
-VOICE_ASSIST_TRIGGER (gRPC) → Microphone → PortAudio → whisper.cpp (STT) → Ollama (LLM) → Terminal
+VOICE_ASSIST_TRIGGER (gRPC)
+  → Microphone (PortAudio)
+  → whisper.cpp  (STT)
+  → Ollama       (LLM)
+  → Piper        (TTS)
+  → Speaker      (PortAudio)
 ```
 
 ---
@@ -25,6 +37,7 @@ sudo apt update
 sudo apt install -y \
     build-essential \
     cmake \
+    ninja-build \
     git \
     pkg-config \
     portaudio19-dev \
@@ -40,6 +53,7 @@ sudo apt install -y \
 sudo dnf install -y \
     gcc-c++ \
     cmake \
+    ninja-build \
     git \
     pkgconf \
     portaudio-devel \
@@ -57,14 +71,11 @@ Ollama serves the LLM locally over a REST API.
 curl -fsSL https://ollama.com/install.sh | sh
 ```
 
-Pull a model suited to the RPi5's RAM (8 GB recommended):
+Pull a model suited to the target board's RAM (8 GB recommended):
 
 ```bash
-# 3B — good balance of speed and quality on RPi5
-ollama pull llama3.2:3b
-
-# 1B — fastest option
-ollama pull llama3.2:1b
+ollama pull llama3.2:3b   # good balance of speed and quality on RPi5
+ollama pull llama3.2:1b   # fastest option
 ```
 
 Ollama starts automatically as a systemd service after install. To check:
@@ -75,43 +86,68 @@ systemctl status ollama
 ollama serve
 ```
 
-### 3. Whisper GGML model
+### 3. Piper TTS
 
-whisper.cpp uses its own quantised `.bin` model format. Download directly from
-Hugging Face (the `bash <(curl ...)` process-substitution method fails on some
-Linux kernels because the helper script tries to `cd` to its own `/proc` path):
+Piper is not in the standard apt repositories (except Ubuntu 24.04+). The
+`scripts/download_models.sh` script handles downloading the correct prebuilt
+binary for your architecture (x86\_64, aarch64, or armv7l) along with all
+model files — see the **Models** section below.
+
+If you are on **Ubuntu 24.04+** and prefer apt:
 
 ```bash
-mkdir -p models
-curl -L --progress-bar \
-  -o models/ggml-medium.bin \
-  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"
+sudo apt install piper-tts
 ```
 
-Substitute `ggml-medium.bin` with any name from the table below:
+Otherwise, run the download script and it will install the binary under
+`bin/piper/` in the project directory. `test/run_velan.sh` adds this to
+`PATH` automatically.
 
-| Model | File | Size on disk | RPi5 latency (approx) | Notes |
-|---|---|---|---|---|
-| `tiny` | `ggml-tiny.bin` | 75 MB | ~1 s | Low accuracy |
-| `base` | `ggml-base.bin` | 142 MB | ~2 s | Decent accuracy |
-| `small` | `ggml-small.bin` | 466 MB | ~4 s | Good accuracy |
-| `medium` | `ggml-medium.bin` | 1.5 GB | ~8–12 s | **Recommended** |
-| `large-v3` | `ggml-large-v3.bin` | 3.1 GB | >30 s | Too slow on CPU |
+### 4. Models
 
-The model file will be saved to `models/ggml-<name>.bin`.
+Download all required model files and the Piper binary in one step:
+
+```bash
+./scripts/download_models.sh
+```
+
+This downloads (and skips any file that already exists):
+
+| File | Destination | Purpose |
+|------|-------------|---------|
+| `ggml-medium.bin` | `models/stt/` | Whisper STT model |
+| `en_US-lessac-medium.onnx` | `models/tts/` | Piper voice model |
+| `en_US-lessac-medium.onnx.json` | `models/tts/` | Piper voice config |
+| `piper` binary + libs | `bin/piper/` | Piper TTS executable |
+
+Alternative Whisper models (trade accuracy for speed):
+
+| Model | Size | RPi5 latency | Notes |
+|-------|------|--------------|-------|
+| `ggml-tiny.bin` | 75 MB | ~1 s | Low accuracy |
+| `ggml-base.bin` | 142 MB | ~2 s | Decent accuracy |
+| `ggml-small.bin` | 466 MB | ~4 s | Good accuracy |
+| `ggml-medium.bin` | 1.5 GB | ~8–12 s | **Default** |
+| `ggml-large-v3.bin` | 3.1 GB | >30 s | Too slow on CPU |
 
 ---
 
 ## Build
 
-CMake fetches whisper.cpp and nlohmann/json automatically at configure time — no manual submodule steps needed.
+CMake fetches whisper.cpp and nlohmann/json automatically at configure time —
+no manual submodule steps needed.
+
+Use the build script for a parallel build:
+
+```bash
+./scripts/build.sh            # CPU build
+./scripts/build.sh --cuda     # GPU build (requires CUDA Toolkit 12.8+)
+./scripts/build.sh --cuda -j4 # GPU build, 4 cores
+```
 
 ### PC with Nvidia GPU (primary development target)
 
-Requires **CUDA Toolkit 12.8+**. The RTX 5070 (Blackwell/sm_120) is not
-supported by older toolkits, and CUDA 11.x is incompatible with GCC 11.
-
-Verify what is installed:
+Requires **CUDA Toolkit 12.8+**. Verify:
 
 ```bash
 nvcc --version    # must say 12.8 or later
@@ -121,41 +157,24 @@ nvidia-smi        # confirm GPU is visible
 Install or upgrade to CUDA 12.8 on Ubuntu 22.04:
 
 ```bash
-# Remove old CUDA if present
 sudo apt remove --purge 'cuda*' 'libcuda*' 'nvidia-cuda*' && sudo apt autoremove
 
-# Add NVIDIA package repository
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb
 sudo apt update
 sudo apt install -y cuda-toolkit-12-8
 
-# Add to PATH (also add to ~/.bashrc)
 export PATH=/usr/local/cuda-12.8/bin:$PATH
 export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH
 ```
 
-Configure and build with CUDA enabled:
+### Raspberry Pi 5 (deployment target)
+
+No CUDA on RPi — ARM NEON is used automatically:
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
-cmake --build build -j$(nproc)
+./scripts/build.sh
 ```
-
-whisper.cpp will offload Whisper inference to the GPU. On an RTX 5070 expect
-transcription in under 1 second for most utterances.
-
-### Raspberry Pi 5 + AI HAT (deployment target)
-
-No CUDA on RPi — the build uses ARM NEON automatically:
-
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j4
-```
-
-The Hailo-8L accelerator (13 TOPS) is not used by whisper.cpp; see the
-**Hailo AI HAT+ note** section below.
 
 ### Optional: install system-wide
 
@@ -168,91 +187,87 @@ sudo cmake --install build
 
 ## Usage
 
-Velan no longer uses keyboard input. It waits for `VOICE_ASSIST_TRIGGER` events
-from a gRPC server (the ECU — IVI, Cluster, or ADAS). Recording starts on
-`TRIGGER_ON` and stops on `TRIGGER_OFF`.
+Velan waits for `VOICE_ASSIST_TRIGGER` events from a VHAL gRPC server.
+Recording starts on `TRIGGER_ON` and stops on `TRIGGER_OFF`, after which the
+captured audio is transcribed, sent to the LLM, and the reply is spoken aloud.
 
 ```bash
-./build/velan [whisper_model_path] [ollama_model] [grpc_server]
+./build/velan [OPTIONS]
 ```
 
-| Argument | Default | Example |
-|---|---|---|
-| `whisper_model_path` | `models/ggml-medium.bin` | `models/ggml-small.bin` |
-| `ollama_model` | `llama3.2` | `llama3.2:3b` |
-| `grpc_server` | `localhost:50055` | `192.168.1.10:50055` |
+| Option | Default | Example |
+|--------|---------|---------|
+| `--vmodel <path>` | `models/stt/ggml-medium.bin` | `models/stt/ggml-small.bin` |
+| `--tts <path>` | `models/tts/en_US-lessac-medium.onnx` | `models/tts/en_GB-jenny-medium.onnx` |
+| `--llm <model>` | `llama3.2:3b` | `gemma4:26b` |
+| `--server <host:port>` | `localhost:50051` | `192.168.1.10:50051` |
 
-### Testing with the Python trigger server
+### Quick start
 
-`test/trigger_velan.py` is a gRPC client that writes the `VOICE_ASSIST_TRIGGER`
-property to VHAL core via `SetValues`.  VHAL core must already be running.
+```bash
+# Download models and Piper binary (once)
+./scripts/download_models.sh
 
-Install the Python deps once:
+# Build (once)
+./scripts/build.sh
+
+# Run (starts vhal-core and velan together, Ctrl+C stops both)
+./test/run_velan.sh
+```
+
+### Testing with the Python trigger client
+
+`test/trigger_velan.py` is a gRPC client that writes `VOICE_ASSIST_TRIGGER`
+to VHAL core via `SetValues`.
+
+Install Python deps once:
 
 ```bash
 pip install grpcio grpcio-tools
 ```
 
-Start VHAL core (Terminal 1 — see vhal-core repo):
-
-```bash
-./vhal-server
-```
-
-Start Velan (Terminal 2):
-
-```bash
-./build/velan
-```
-
-In Terminal 3, type `on` to begin recording and `off` to stop and get a response:
+With `test/run_velan.sh` already running, open a second terminal:
 
 ```bash
 python3 test/trigger_velan.py
 ```
 
 ```
-Connected to VHAL server at localhost:50051
 Commands: on | off | quit
 
 trigger> on
-  → TRIGGER_ON  sent  (status: [0])
+  → TRIGGER_ON  sent
 trigger> off
-  → TRIGGER_OFF sent  (status: [0])
-trigger>
+  → TRIGGER_OFF sent
 ```
 
-Velan output in Terminal 2:
+Velan output:
 
 ```
-[Velan] Loading Whisper model (CPU): models/ggml-medium.bin
-[Velan] Whisper model loaded.
-[Velan] Ollama model: llama3.2
-[Velan] Connecting to trigger server at localhost:50055
-[Velan] Subscribed to VOICE_ASSIST_TRIGGER events. Waiting...
 [Velan] TRIGGER_ON  — recording started.
 [Velan] TRIGGER_OFF — recording stopped.
 [Velan] Transcribing...
-[Velan] You said:  What is the capital of France?
+[Velan] You said:  What is the capital of Tamil Nadu?
 [Velan] Thinking...
-[Velan] Assistant: The capital of France is Paris.
+[Velan] Assistant: Chennai.
 ```
 
+Followed by Piper speaking the reply through the default audio output.
 Conversation history is preserved across turns within a session.
-Velan reconnects automatically if the trigger server restarts.
 
 ---
 
 ## Hailo AI HAT+ note
 
-The Hailo-8L accelerator (13 TOPS) does not natively run whisper.cpp — it requires
-models compiled through [Hailo Dataflow Compiler](https://hailo.ai/developer-zone/documentation/)
-into Hailo Executable Format (HEF). whisper.cpp runs on the RPi5 CPU instead, using
-ARM NEON SIMD automatically. This is sufficient for interactive use with `small` or
-`medium` models.
+The Hailo-8L accelerator (13 TOPS) does not natively run whisper.cpp — it
+requires models compiled through
+[Hailo Dataflow Compiler](https://hailo.ai/developer-zone/documentation/)
+into Hailo Executable Format (HEF). whisper.cpp runs on the RPi5 CPU instead,
+using ARM NEON SIMD automatically. This is sufficient for interactive use with
+`small` or `medium` models.
 
-Hailo HAT acceleration for Whisper would be a separate integration step outside the
-scope of this project.
+Hailo HAT acceleration for Whisper would be a separate integration step outside
+the scope of this project.
 
 ---
 
@@ -260,45 +275,35 @@ scope of this project.
 
 **No audio input detected**
 
-List available devices and confirm your microphone appears:
-
 ```bash
 pactl list sources short
-```
-
-Set the default source if needed:
-
-```bash
 pactl set-default-source <source-name>
 ```
 
 **Whisper model fails to load**
 
-Confirm the file exists and is not zero bytes:
-
 ```bash
-ls -lh models/
+ls -lh models/stt/
+./scripts/download_models.sh   # re-downloads missing files, skips existing ones
 ```
 
-Re-download using the `curl` command in the **Whisper GGML model** section above.
+**Piper not found or TTS silent**
+
+```bash
+./scripts/download_models.sh   # downloads Piper binary to ~/.local/bin/piper
+# Always launch via test/run_velan.sh — it sets PATH and LD_LIBRARY_PATH
+```
 
 **Ollama connection refused**
-
-Ensure Ollama is running before starting the assistant:
 
 ```bash
 ollama serve
 ```
 
-By default the assistant connects to `http://localhost:11434`. If Ollama runs on
-another host, set `OLLAMA_CHAT_URL` in `src/main.cpp` and rebuild.
-
 **Slow transcription on RPi5**
 
-Switch to a smaller model:
-
 ```bash
-./build/velan models/ggml-small.bin llama3.2:1b
+./build/velan --vmodel models/stt/ggml-small.bin --llm llama3.2:1b
 ```
 
 ---
@@ -308,13 +313,23 @@ Switch to a smaller model:
 ```
 velan/
 ├── src/
-│   └── main.cpp          # Full pipeline: VHAL trigger → audio → Whisper → Ollama
-├── models/               # GGML model files (gitignored, download separately)
+│   ├── main.cpp                    VHAL gRPC polling loop, CLI, signal handling
+│   ├── Speech2TextManager.h/.cpp   Singleton: PortAudio capture + Whisper STT
+│   ├── TransformerManager.h/.cpp   Ollama conversation history + HTTP chat
+│   └── Text2SpeechManager.h/.cpp   Piper TTS subprocess + PortAudio playback
+├── scripts/
+│   ├── build.sh                    Configure + parallel build (Ninja, --cuda flag)
+│   └── download_models.sh          Download Whisper model, Piper voice + binary
+├── models/
+│   ├── stt/                        Whisper model files (gitignored)
+│   └── tts/                        Piper voice model files (gitignored)
 ├── test/
-│   └── trigger_velan.py  # Python gRPC client — writes VOICE_ASSIST_TRIGGER to VHAL
-├── CMakeLists.txt        # Generates C++ stubs from vhal-core proto files
+│   ├── trigger_velan.py            Python gRPC client — sends VOICE_ASSIST_TRIGGER
+│   └── run_velan.sh                Starts vhal-core + velan, Ctrl+C stops both
+├── CMakeLists.txt
+├── ARCHITECTURE.md
 └── README.md
 ```
 
-Proto files are consumed directly from `~/labs/networking/vhal-core/test/vhal/`
-— no duplication in this repo.
+Proto files are consumed directly from
+`~/labs/networking/vhal-core/test/vhal/` — no duplication in this repo.
