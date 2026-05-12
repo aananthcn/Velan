@@ -208,6 +208,7 @@ add_executable(velan
     src/Speech2TextManager.cpp
     src/TransformerManager.cpp
     src/Text2SpeechManager.cpp
+    src/WakeWordDetector.cpp
 )
 
 target_include_directories(velan PRIVATE

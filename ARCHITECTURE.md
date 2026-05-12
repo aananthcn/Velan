@@ -22,35 +22,45 @@ vehicle property change events. It does not expose any server port of its own.
 │                              │  0.0.0.0:50051  │    │
 │                              └────────┬────────┘    │
 └───────────────────────────────────────┼─────────────┘
-                                        │ StartPropertyValuesStream
-                                        │ (server-streaming RPC)
+                                        │ GetValues (10 Hz poll)
                                         ▼
                               ┌─────────────────┐
                               │     Velan        │
                               │  (gRPC client)  │
                               └────────┬────────┘
-                                       │ filters prop == 0x21400001
                                        │
-                    ┌──────────────────┴──────────────────┐
-                    │                                     │
-              int32_values[0] == 1               int32_values[0] == 0
-              (TRIGGER_ON)                       (TRIGGER_OFF)
-                    │                                     │
-                    ▼                                     ▼
-             Start recording                      Stop recording
-             (PortAudio)                          (PortAudio)
-                                                        │
-                                                        ▼
-                                               whisper.cpp  (STT)
-                                                        │
-                                                        ▼
-                                               Ollama  (LLM)
-                                                        │
-                                                        ▼
-                                               Piper   (TTS)
-                                                        │
-                                                        ▼
-                                               PortAudio speaker output
+             ┌─────────────────────────┴──────────────────────────┐
+             │  VHAL gRPC trigger                                  │  Wake word trigger
+             │  prop == 0x21400001                                 │  (whisper.cpp)
+             │                                                     │
+             │  TRIGGER_ON  (1) ──┐                  "ON"  ────────┤
+             │  TRIGGER_OFF (0) ──┤                  "OFF" ────────┤
+             │                    ▼                                ▼
+             │          ┌──────────────────────────────────────────┐
+             │          │       Speech2TextManager::handle_trigger  │
+             │          └──────────────────┬───────────────────────┘
+             └─────────────────────────────┘
+                                           │
+                    ┌──────────────────────┴──────────────────────┐
+                    │                                             │
+                state == 1                                   state == 0
+                (start)                                      (stop)
+                    │                                             │
+                    ▼                                             ▼
+             Start recording                              Stop recording
+             (PortAudio)                                  (PortAudio)
+                                                                 │
+                                                                 ▼
+                                                        whisper.cpp  (STT)
+                                                                 │
+                                                                 ▼
+                                                        Ollama  (LLM)
+                                                                 │
+                                                                 ▼
+                                                        Piper   (TTS)
+                                                                 │
+                                                                 ▼
+                                                        PortAudio speaker output
 ```
 
 ---
@@ -142,6 +152,7 @@ trigger_velan.py  ──SetValues──▶  VHAL core  ──stream──▶  Ve
 | Ollama | LLM REST server | Same host as Velan |
 | whisper.cpp | STT library | Linked into Velan binary |
 | Piper | TTS subprocess | Installed on same host |
+| whisper.cpp (tiny) | Wake word detection (`--wakeword`) | Linked into Velan binary |
 
 ---
 
@@ -152,11 +163,13 @@ src/
 ├── main.cpp                      VHAL gRPC polling loop, CLI, signal handling
 ├── Speech2TextManager.h/.cpp     Singleton: PortAudio capture + Whisper STT
 ├── TransformerManager.h/.cpp     Ollama conversation history + HTTP chat
-└── Text2SpeechManager.h/.cpp     Piper TTS subprocess + PortAudio playback
+├── Text2SpeechManager.h/.cpp     Piper TTS subprocess + PortAudio playback
+└── WakeWordDetector.h/.cpp       whisper.cpp sliding-window wake word detector
 
 scripts/
-├── build.sh                      Configure + parallel build (Ninja, --cuda flag)
-└── download_models.sh            Download Whisper and Piper voice models
+├── build_velan.sh                Configure + parallel build (Ninja, --cuda flag)
+├── run_velan.sh                  Start vhal-core + velan together, Ctrl-C stops both
+└── download_models.sh            Download Whisper models (medium + tiny) and Piper
 
 models/
 ├── stt/
@@ -188,21 +201,46 @@ models/
 - Constructor verifies the Piper voice model file is present; throws with download instructions if not
 - `speak()` forks a `piper` subprocess, writes text to its stdin, reads back raw 16-bit PCM from stdout, and plays it via PortAudio at 22050 Hz
 
+**`WakeWordDetector`** owns the wake-word pipeline (pure C++, no external runtime):
+- Constructor loads a Whisper model (typically `ggml-tiny.bin`) and initialises PortAudio; throws on failure
+- Destructor frees the Whisper context and terminates PortAudio
+- `start()` spawns a detection thread; `stop()` sets the stop flag and joins
+- `detect_loop()` maintains a 1.5 s sliding PCM window (advances by 1 s per step at 16 kHz via PortAudio); on each step with sufficient RMS energy (VAD gate) it runs `whisper_full()` and checks the transcript for the configured wake phrase (case-insensitive, punctuation-tolerant substring match)
+- On match: releases the PortAudio stream, calls `callback_(1)`, waits `recording_timeout_ms`, calls `callback_(0)`, then reopens the stream for the next phrase
+- Enabled at runtime with `--wakeword`; tunable via `--wwmodel`, `--wwphrase`, `--wwtimeout`
+
 ### Naming rationale
 
 `Speech2TextManager` and `Text2SpeechManager` name the direction of conversion explicitly, making the pipeline readable left-to-right. `TransformerManager` reflects that the class drives a transformer-based LLM, keeping HTTP and history logic separate from audio concerns.
 
 ### Composition and call chain
 
-`Speech2TextManager` owns `TransformerManager` and `Text2SpeechManager` by value. The full pipeline on TRIGGER_OFF:
+`Speech2TextManager` owns `TransformerManager` and `Text2SpeechManager` by value.
+`WakeWordDetector` holds a callback bound to `Speech2TextManager::handle_trigger`
+and runs independently in main.
 
 ```
-Speech2TextManager::handle_trigger(0)
-  └─ Speech2TextManager::process()
-       ├─ transcribe()               (whisper.cpp, file-local)
-       ├─ TransformerManager::chat()
-       │    └─ Ollama REST API       (libcurl, file-local)
-       └─ Text2SpeechManager::speak()
-            ├─ fork + exec piper
-            └─ PortAudio output stream
+main()
+  ├─ WakeWordDetector::start()          ← parallel wake-word path (--wakeword)
+  │    └─ detect_loop thread
+  │         └─ PortAudio → 1.5 s sliding window → whisper_full() → phrase match
+  │              └─ match → callback_(1/0)
+  │                              │
+  │                              ▼
+  │                  Speech2TextManager::handle_trigger()
+  │
+  └─ gRPC poll loop              ← VHAL hardware button path (always active)
+       └─ VOICE_ASSIST_TRIGGER 1/0
+                          │
+                          ▼
+              Speech2TextManager::handle_trigger()
+                          │
+                          ▼ (on TRIGGER_OFF / "OFF")
+              Speech2TextManager::process()
+                ├─ transcribe()               (whisper.cpp, file-local)
+                ├─ TransformerManager::chat()
+                │    └─ Ollama REST API       (libcurl, file-local)
+                └─ Text2SpeechManager::speak()
+                     ├─ fork + exec piper
+                     └─ PortAudio output stream
 ```

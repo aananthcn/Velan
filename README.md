@@ -100,7 +100,7 @@ sudo apt install piper-tts
 ```
 
 Otherwise, run the download script and it will install the binary under
-`bin/piper/` in the project directory. `test/run_velan.sh` adds this to
+`bin/piper/` in the project directory. `scripts/run_velan.sh` adds this to
 `PATH` automatically.
 
 ### 4. Models
@@ -140,9 +140,9 @@ no manual submodule steps needed.
 Use the build script for a parallel build:
 
 ```bash
-./scripts/build.sh            # CPU build
-./scripts/build.sh --cuda     # GPU build (requires CUDA Toolkit 12.8+)
-./scripts/build.sh --cuda -j4 # GPU build, 4 cores
+./scripts/build_velan.sh            # CPU build
+./scripts/build_velan.sh --cuda     # GPU build (requires CUDA Toolkit 12.8+)
+./scripts/build_velan.sh --cuda -j4 # GPU build, 4 cores
 ```
 
 ### PC with Nvidia GPU (primary development target)
@@ -173,7 +173,7 @@ export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH
 No CUDA on RPi — ARM NEON is used automatically:
 
 ```bash
-./scripts/build.sh
+./scripts/build_velan.sh
 ```
 
 ### Optional: install system-wide
@@ -197,10 +197,14 @@ captured audio is transcribed, sent to the LLM, and the reply is spoken aloud.
 
 | Option | Default | Example |
 |--------|---------|---------|
-| `--vmodel <path>` | `models/stt/ggml-medium.bin` | `models/stt/ggml-small.bin` |
-| `--tts <path>` | `models/tts/en_US-lessac-medium.onnx` | `models/tts/en_GB-jenny-medium.onnx` |
-| `--llm <model>` | `llama3.2:3b` | `gemma4:26b` |
+| `--sttmodel <path>` | `models/stt/ggml-medium.bin` | `models/stt/ggml-small.bin` |
+| `--ttsmodel <path>` | `models/tts/en_US-lessac-medium.onnx` | `models/tts/en_GB-jenny-medium.onnx` |
+| `--llmodel <model>` | `llama3.2:3b` | `gemma4:26b` |
 | `--server <host:port>` | `localhost:50051` | `192.168.1.10:50051` |
+| `--wwmodel <path>` | `models/stt/ggml-tiny.bin` | `models/stt/ggml-base.bin` |
+| `--wwphrase <phrase>` | `Subramani` | `hey jarvis` |
+| `--wwsilence <ms>` | `2000` | `3000` |
+| `--wwtimeout <ms>` | `120000` | `60000` |
 
 ### Quick start
 
@@ -209,10 +213,10 @@ captured audio is transcribed, sent to the LLM, and the reply is spoken aloud.
 ./scripts/download_models.sh
 
 # Build (once)
-./scripts/build.sh
+./scripts/build_velan.sh
 
 # Run (starts vhal-core and velan together, Ctrl+C stops both)
-./test/run_velan.sh
+./scripts/run_velan.sh
 ```
 
 ### Testing with the Python trigger client
@@ -226,7 +230,7 @@ Install Python deps once:
 pip install grpcio grpcio-tools
 ```
 
-With `test/run_velan.sh` already running, open a second terminal:
+With `scripts/run_velan.sh` already running, open a second terminal:
 
 ```bash
 python3 test/trigger_velan.py
@@ -291,7 +295,7 @@ ls -lh models/stt/
 
 ```bash
 ./scripts/download_models.sh   # downloads Piper binary to ~/.local/bin/piper
-# Always launch via test/run_velan.sh — it sets PATH and LD_LIBRARY_PATH
+# Always launch via scripts/run_velan.sh — it sets PATH and LD_LIBRARY_PATH
 ```
 
 **Ollama connection refused**

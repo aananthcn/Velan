@@ -27,6 +27,7 @@ PIPER_LIB_DIR="$HOME/.local/lib/piper"
 PIPER_BIN="$HOME/.local/bin/piper"
 
 STT_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"
+STT_TINY_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin"
 
 TTS_VOICE="en_US-lessac-medium"
 TTS_BASE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium"
@@ -118,6 +119,10 @@ EOF
 download "$STT_URL" \
          "$STT_DIR/ggml-medium.bin" \
          "Whisper medium (STT)"
+
+download "$STT_TINY_URL" \
+         "$STT_DIR/ggml-tiny.bin" \
+         "Whisper tiny (wake word detector)"
 
 download "$TTS_BASE_URL/${TTS_VOICE}.onnx" \
          "$TTS_DIR/${TTS_VOICE}.onnx" \

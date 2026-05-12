@@ -15,7 +15,7 @@
 #pragma once
 
 #include <atomic>
-#include <cstdint>
+#include <functional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -28,20 +28,30 @@
 
 class Speech2TextManager {
 public:
+    // on_start: called before recording begins — use it to pause WakeWordDetector.
+    // on_done:  called after TTS finishes   — use it to resume WakeWordDetector.
     static Speech2TextManager& instance(const std::string& ollama_model,
                                         const char* stt_model_path,
-                                        const char* tts_model_path);
+                                        const char* tts_model_path,
+                                        std::function<void()> on_start,
+                                        std::function<void()> on_done);
 
     Speech2TextManager(const Speech2TextManager&)            = delete;
     Speech2TextManager& operator=(const Speech2TextManager&) = delete;
 
-    void handle_trigger(int32_t state);
-    void stop_if_recording();
+    // Starts the PROCESSING pipeline: record → transcribe → LLM → TTS → on_done.
+    // No-op if already recording.
+    void handle_trigger();
+
+    // Exposes the loaded Whisper context so WakeWordDetector can share it.
+    whisper_context* get_context() const { return ctx_; }
 
 private:
     Speech2TextManager(const std::string& ollama_model,
                        const char* stt_model_path,
-                       const char* tts_model_path);
+                       const char* tts_model_path,
+                       std::function<void()> on_start,
+                       std::function<void()> on_done);
     ~Speech2TextManager();
 
     void process();
@@ -50,8 +60,10 @@ private:
     Text2SpeechManager     tts_;
     whisper_context_params wparams_;
     whisper_context*       ctx_;
+    std::function<void()>  on_start_;
+    std::function<void()>  on_done_;
 
-    bool               is_recording_;
+    std::atomic<bool>  is_recording_;
     std::atomic<bool>  stop_recording_;
     std::thread        rec_thread_;
     std::vector<float> audio_;

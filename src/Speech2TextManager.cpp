@@ -15,27 +15,41 @@
 #include "Speech2TextManager.h"
 
 #include <array>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 
 #include <portaudio.h>
 
-static const int SAMPLE_RATE     = 16000;
-static const int CHUNK_FRAMES    = 1024;
-static const int WHISPER_THREADS = 4;
+static const int   SAMPLE_RATE        = 16000;
+static const int   CHUNK_FRAMES       = 1024;
+static const int   WHISPER_THREADS    = 4;
+
+// VAD parameters for end-of-speech detection inside record_audio().
+static constexpr float VAD_RMS_THRESHOLD     = 0.01f;
+static constexpr int   VAD_SILENCE_CHUNKS    = 15;              // ~960 ms of silence ends recording
+static constexpr int   VAD_MIN_SPEECH_CHUNKS = 5;               // must see ~320 ms of speech first
+static constexpr int   VAD_MAX_RECORD_FRAMES = SAMPLE_RATE * 90; // hard cap: 1.5 min
 
 extern volatile bool g_interrupted;
 
 
 // ---------------------------------------------------------------------------
-// Audio recording — stops when stop_flag is set or g_interrupted fires
+// Audio recording — self-terminating via VAD.
+// Stops when: sustained silence after speech, stop_flag set, or g_interrupted.
 // ---------------------------------------------------------------------------
 static std::vector<float> record_audio(std::atomic<bool>& stop_flag) {
     PaStream* stream = nullptr;
-    PaError   err;
+    PaError   err    = paNoError;
 
-    err = Pa_OpenDefaultStream(&stream, 1, 0, paFloat32,
-                               SAMPLE_RATE, CHUNK_FRAMES, nullptr, nullptr);
+    // WWD may still be releasing the mic (up to one CHUNK_MS ≈ 100 ms).
+    // Retry for up to 500 ms before giving up.
+    for (int attempt = 0; attempt < 10 && !stop_flag.load(); ++attempt) {
+        err = Pa_OpenDefaultStream(&stream, 1, 0, paFloat32,
+                                   SAMPLE_RATE, CHUNK_FRAMES, nullptr, nullptr);
+        if (err == paNoError) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     if (err != paNoError)
         throw std::runtime_error(std::string("Pa_OpenDefaultStream: ") + Pa_GetErrorText(err));
 
@@ -49,9 +63,33 @@ static std::vector<float> record_audio(std::atomic<bool>& stop_flag) {
     samples.reserve(SAMPLE_RATE * 30);
 
     std::array<float, CHUNK_FRAMES> buf;
+    int  speech_chunks  = 0;
+    int  silence_chunks = 0;
+    bool speech_started = false;
+
     while (!g_interrupted && !stop_flag.load()) {
-        Pa_ReadStream(stream, buf.data(), CHUNK_FRAMES);
+        if ((int)samples.size() >= VAD_MAX_RECORD_FRAMES) {
+            std::cout << "[Velan] Max recording duration reached — stopping.\n";
+            break;
+        }
+
+        if (Pa_ReadStream(stream, buf.data(), CHUNK_FRAMES) != paNoError) break;
         samples.insert(samples.end(), buf.begin(), buf.end());
+
+        float energy = 0.0f;
+        for (float s : buf) energy += s * s;
+        const bool is_speech = std::sqrt(energy / CHUNK_FRAMES) >= VAD_RMS_THRESHOLD;
+
+        if (is_speech) {
+            ++speech_chunks;
+            silence_chunks  = 0;
+            speech_started  = (speech_chunks >= VAD_MIN_SPEECH_CHUNKS);
+        } else if (speech_started) {
+            if (++silence_chunks >= VAD_SILENCE_CHUNKS) {
+                std::cout << "[Velan] End of speech detected.\n";
+                break;
+            }
+        }
     }
 
     Pa_StopStream(stream);
@@ -94,15 +132,21 @@ static std::string transcribe(whisper_context* ctx, const std::vector<float>& pc
 // ---------------------------------------------------------------------------
 Speech2TextManager& Speech2TextManager::instance(const std::string& ollama_model,
                                                   const char* stt_model_path,
-                                                  const char* tts_model_path) {
-    static Speech2TextManager inst(ollama_model, stt_model_path, tts_model_path);
+                                                  const char* tts_model_path,
+                                                  std::function<void()> on_start,
+                                                  std::function<void()> on_done) {
+    static Speech2TextManager inst(ollama_model, stt_model_path, tts_model_path,
+                                   std::move(on_start), std::move(on_done));
     return inst;
 }
 
 Speech2TextManager::Speech2TextManager(const std::string& ollama_model,
                                         const char* stt_model_path,
-                                        const char* tts_model_path)
+                                        const char* tts_model_path,
+                                        std::function<void()> on_start,
+                                        std::function<void()> on_done)
     : transformer_(ollama_model), tts_(tts_model_path), ctx_(nullptr),
+      on_start_(std::move(on_start)), on_done_(std::move(on_done)),
       is_recording_(false), stop_recording_(false) {
     if (Pa_Initialize() != paNoError)
         throw std::runtime_error("PortAudio init failed");
@@ -128,42 +172,33 @@ Speech2TextManager::Speech2TextManager(const std::string& ollama_model,
 }
 
 Speech2TextManager::~Speech2TextManager() {
-    stop_if_recording();
+    stop_recording_ = true;
+    if (rec_thread_.joinable()) rec_thread_.join();
     whisper_free(ctx_);
     Pa_Terminate();
 }
 
 
-void Speech2TextManager::handle_trigger(int32_t state) {
-    if (state == 1 && !is_recording_) {
-        audio_.clear();
-        stop_recording_ = false;
-        is_recording_   = true;
-        rec_thread_ = std::thread([this]() {
-            try {
-                audio_ = record_audio(stop_recording_);
-            } catch (const std::exception& e) {
-                std::cerr << "[Velan] Recording error: " << e.what() << "\n";
-            }
-        });
-        std::cout << "[Velan] TRIGGER_ON  — recording started.\n";
+void Speech2TextManager::handle_trigger() {
+    if (is_recording_.exchange(true)) return;   // already in PROCESSING state
 
-    } else if (state == 0 && is_recording_) {
-        stop_recording_ = true;
-        is_recording_   = false;
-        if (rec_thread_.joinable()) rec_thread_.join();
-        std::cout << "[Velan] TRIGGER_OFF — recording stopped.\n";
+    if (on_start_) on_start_();   // pause WWD before taking the mic
+
+    if (rec_thread_.joinable()) rec_thread_.join();
+    audio_.clear();
+    stop_recording_ = false;
+
+    rec_thread_ = std::thread([this]() {
+        std::cout << "[Velan] PROCESSING — recording started.\n";
+        try {
+            audio_ = record_audio(stop_recording_);
+        } catch (const std::exception& e) {
+            std::cerr << "[Velan] Recording error: " << e.what() << "\n";
+        }
         process();
-    }
-}
-
-
-void Speech2TextManager::stop_if_recording() {
-    if (is_recording_) {
-        stop_recording_ = true;
-        if (rec_thread_.joinable()) rec_thread_.join();
         is_recording_ = false;
-    }
+        if (on_done_) on_done_();   // PROCESSING → LISTENING: resume WakeWordDetector
+    });
 }
 
 
