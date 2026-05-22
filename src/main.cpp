@@ -22,12 +22,16 @@
 #include <thread>
 #include <vector>
 
+#include <portaudio.h>
 #include <grpcpp/grpcpp.h>
 
 #include "VehicleServer.grpc.pb.h"
 #include "VehicleServer.pb.h"
 
+#include "log.h"
 #include "Speech2TextManager.h"
+#include "Text2SpeechManager.h"
+#include "TransformerManager.h"
 #include "WakeWordDetector.h"
 
 namespace vhal = ::android::hardware::automotive::vehicle::proto;
@@ -35,11 +39,11 @@ namespace vhal = ::android::hardware::automotive::vehicle::proto;
 // ---------------------------------------------------------------------------
 // Config — override via CLI: ./velan [OPTIONS]
 // ---------------------------------------------------------------------------
-static const char* DEFAULT_WHISPER_MODEL  = "models/stt/ggml-medium.bin";
-static const char* DEFAULT_TTS_MODEL      = "models/tts/en_US-lessac-medium.onnx";
+static const char* DEFAULT_STT_MODEL      = "models/stt/ggml-medium.bin"; // Whisper C++
+static const char* DEFAULT_TTS_MODEL      = "models/tts/en_US-lessac-medium.onnx"; // Piper
 static const char* DEFAULT_OLLAMA_MODEL   = "llama3.2:3b";
 static const char* DEFAULT_VHAL_SERVER    = "localhost:50051";
-static const char* DEFAULT_WAKEWORD_PHRASE = WWD_DEFAULT_WAKE_WORD;
+static const char* DEFAULT_WAKEWORD_PHRASE = WWD_DEFAULT_WAKE_WORDS;
 
 // Poll interval for GetValues (milliseconds). 10 Hz matches vhal-gateway.
 static const int POLL_INTERVAL_MS = 100;
@@ -56,17 +60,33 @@ static const int32_t VOICE_ASSIST_TRIGGER = 0x21400001;
 // Runtime configuration
 // ---------------------------------------------------------------------------
 struct VelanConfigs {
-    std::string stt_model       = DEFAULT_WHISPER_MODEL;
+    std::string stt_model       = DEFAULT_STT_MODEL;
     std::string tts_model       = DEFAULT_TTS_MODEL;
     std::string ollama_model    = DEFAULT_OLLAMA_MODEL;
     std::string vhal_server     = DEFAULT_VHAL_SERVER;
     std::string wakeword_phrase = DEFAULT_WAKEWORD_PHRASE;
+    int         mic_device      = -1;   // -1 = PortAudio system default; override with --mic
 };
 
 
 // ---------------------------------------------------------------------------
 // CLI handling
 // ---------------------------------------------------------------------------
+// Print all PortAudio input devices. Pa_Initialize() must have been called.
+static void list_input_devices() {
+    int n = Pa_GetDeviceCount();
+    if (n <= 0) { std::cout << "  (none found)\n"; return; }
+    PaDeviceIndex def = Pa_GetDefaultInputDevice();
+    for (int i = 0; i < n; ++i) {
+        const PaDeviceInfo* d = Pa_GetDeviceInfo(i);
+        if (!d || d->maxInputChannels < 1) continue;
+        std::cout << "  [" << i << "] " << d->name
+                  << "  (" << d->maxInputChannels << " ch, "
+                  << static_cast<int>(d->defaultSampleRate) << " Hz"
+                  << (i == def ? ", default" : "") << ")\n";
+    }
+}
+
 static void print_help(const char* prog) {
     std::cout
         << "Usage: " << prog << " [OPTIONS]\n\n"
@@ -76,13 +96,16 @@ static void print_help(const char* prog) {
         << "  --ttsmodel  <path>    Piper TTS model path\n"
         << "  --llmodel   <name>    Ollama model name\n"
         << "  --wwphrase  <phrases> Comma-separated wake phrases, e.g. \"Subramanya,Hey Vela\"\n"
+        << "  --mic       <index>   PortAudio input device index (use --list-mic to see choices)\n"
+        << "  --list-mic            Print available microphone devices and exit\n"
         << "  --help                Show this help\n\n"
         << "Defaults:\n"
-        << "  STT model       : " << DEFAULT_WHISPER_MODEL   << "\n"
+        << "  STT model       : " << DEFAULT_STT_MODEL   << "\n"
         << "  TTS model       : " << DEFAULT_TTS_MODEL       << "\n"
         << "  LLM model       : " << DEFAULT_OLLAMA_MODEL    << "\n"
         << "  VHAL server     : " << DEFAULT_VHAL_SERVER     << "\n"
-        << "  Wake phrase     : " << DEFAULT_WAKEWORD_PHRASE << "\n";
+        << "  Wake phrase     : " << DEFAULT_WAKEWORD_PHRASE << "\n"
+        << "  Mic device      : system default\n";
 }
 
 static bool parse_cmdline(int argc, char* argv[], VelanConfigs& cfg) {
@@ -121,6 +144,20 @@ static bool parse_cmdline(int argc, char* argv[], VelanConfigs& cfg) {
                 return false;
             }
             cfg.wakeword_phrase = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "--mic") == 0) {
+            if ((i + 1) >= argc) {
+                std::cerr << "[Velan] Missing value for --mic\n";
+                return false;
+            }
+            cfg.mic_device = std::stoi(argv[++i]);
+        }
+        else if (std::strcmp(argv[i], "--list-mic") == 0) {
+            Pa_Initialize();
+            std::cout << "Available audio input devices:\n";
+            list_input_devices();
+            Pa_Terminate();
+            return false;   // exit after listing
         }
         else if (std::strcmp(argv[i], "--help") == 0) {
             print_help(argv[0]);
@@ -180,20 +217,39 @@ int main(int argc, char* argv[]) {
     std::cout << "[Velan] LLM model      : " << cfg.ollama_model   << "\n";
     std::cout << "[Velan] VHAL server    : " << cfg.vhal_server    << "\n";
     std::cout << "[Velan] Wake phrase    : " << cfg.wakeword_phrase << "\n";
+    if (cfg.mic_device < 0)
+        std::cout << "[Velan] Mic device     : system default (use --list-mic to list, --mic N to override)\n";
+    else
+        std::cout << "[Velan] Mic device     : " << cfg.mic_device
+                  << " (use --list-mic to list devices)\n";
     std::cout << "[Velan] =====================================\n";
 
     // wwd declared before STT so the on_start/on_done lambdas can capture it.
     std::unique_ptr<WakeWordDetector> wwd;
 
+    TransformerManager  transformer(cfg.ollama_model);
+    Text2SpeechManager  tts(cfg.tts_model);
+
     // ---- STT: loads the Whisper model (context shared with WWD) ----
     Speech2TextManager* mgr_ptr;
     try {
         mgr_ptr = &Speech2TextManager::instance(
-            cfg.ollama_model,
             cfg.stt_model.c_str(),
-            cfg.tts_model.c_str(),
-            [&wwd]() { if (wwd) wwd->pause(); },       // LISTENING → PROCESSING
-            [&wwd]() { if (wwd) wwd->resume(); }       // PROCESSING → LISTENING
+            [&wwd]() { if (wwd) wwd->pause(); },           // LISTENING → PROCESSING
+            [&transformer, &tts, &wwd](const std::string& text) {
+                if (!text.empty()) {
+                    try {
+                        std::cout << log_ts() << "[Velan] Thinking...\n";
+                        std::string reply = transformer.chat(text);
+                        std::cout << log_ts() << "[Velan] Assistant: " << reply << "\n\n";
+                        tts.speak(reply);
+                    } catch (const std::exception& e) {
+                        std::cerr << log_ts() << "[Velan] Ollama error: " << e.what() << "\n";
+                    }
+                }
+                if (wwd) wwd->resume();                     // PROCESSING → LISTENING
+            },
+            cfg.mic_device
         );
     } catch (const std::exception& e) {
         std::cerr << "[Velan] " << e.what() << "\n";
@@ -207,7 +263,8 @@ int main(int argc, char* argv[]) {
             [&mgr]() { mgr.handle_trigger(); },        // LISTENING → PROCESSING
             mgr.get_context(),
             split_phrases(cfg.wakeword_phrase),
-            0.01f
+            0.01f,
+            cfg.mic_device
         );
         wwd->start();
     } catch (const std::exception& e) {

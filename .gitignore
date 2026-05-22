@@ -7,3 +7,8 @@ test/gen/
 *.deb
 .aider*
 .vscode/
+
+# Conan generated files (placed in build/ by --output-folder, but
+# conan.lock and graph_info.json may appear in the project root)
+conan.lock
+graph_info.json

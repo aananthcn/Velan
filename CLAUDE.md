@@ -119,7 +119,7 @@ The `wwd` null-pointer capture in the lambdas is safe because they are only call
 ./velan --wwphrase "Hey Vela, Subramanya, Subramani, Subrahmanya"
 ```
 
-Default (`WWD_DEFAULT_WAKE_WORD` in `WakeWordDetector.h`): `"Hey Vela, Subramanya, Subramani, Subrahmanya"`
+Default (`WWD_DEFAULT_WAKE_WORDS` in `WakeWordDetector.h`): `"Hey Vela, Subramanya, Subramani, Subrahmanya"`
 
 Internally each phrase is normalised (lower-case, punctuation → spaces, runs collapsed) and stored
 in `wake_phrases_` (vector). `phrase_matches()` checks substring match against all of them.
@@ -182,13 +182,33 @@ Download: `./scripts/download_models.sh`
 
 ## Build
 
+All C++ dependencies (gRPC, Protobuf, PortAudio, libcurl, nlohmann/json, whisper.cpp) are
+managed by **Conan 2.x**. Install it once:
+
 ```bash
-./scripts/build_velan.sh          # CPU build
-./scripts/build_velan.sh --cuda   # GPU build
+pip install conan
+conan profile detect   # creates ~/.conan2/profiles/default
 ```
 
-Or manually:
+Then build with:
+
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target velan -j$(nproc)
+./scripts/build_velan.sh --target pc                        # PC, CPU only
+./scripts/build_velan.sh --target pc --aicore cuda          # PC, CUDA acceleration
+./scripts/build_velan.sh --target rpi                       # Raspberry Pi, CPU only
+./scripts/build_velan.sh --target rpi --aicore hailo8       # Raspberry Pi, Hailo-8 accelerator
 ```
+
+`--target` is required (`pc` or `rpi`). `--aicore` is optional (`cuda` or `hailo8`; default: CPU).
+
+The script runs `conan install` + `source conanbuild.sh` before invoking CMake. The first rpi
+build may take 30–60 min (gRPC built from source for aarch64). Subsequent runs use
+`~/.conan2` cache.
+
+Cross-compilation additionally requires:
+```bash
+sudo apt install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+```
+
+Conan profiles: `profiles/pc` (x86_64) and `profiles/rpi` (armv8, GCC 11).
+Local whisper.cpp Conan recipe: `conan/recipes/whisper/conanfile.py`.

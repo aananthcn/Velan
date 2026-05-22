@@ -24,7 +24,7 @@
 
 #include <whisper.h>
 
-#define WWD_DEFAULT_WAKE_WORD "Hey Vela, Subramanya, Subramani, Subrahmanya, Supramani"
+#define WWD_DEFAULT_WAKE_WORDS "Hey Vela, Subramanya, Subramani, Subrahmanya, Supramani"
 
 // Continuously listens on the microphone in LISTENING state.
 // When the wake phrase is detected, fires callback() and blocks until
@@ -39,10 +39,13 @@ public:
     using TriggerCallback = std::function<void()>;
 
     // wake_phrases: one or more phrases; any match fires the trigger.
+    // mic_device: PortAudio device index, or -1 to use the system default.
+    //             Pass the index from --mic or from list_input_devices() in main.
     WakeWordDetector(TriggerCallback                  cb,
                      whisper_context*                 ctx,
                      const std::vector<std::string>&  wake_phrases,
-                     float                            vad_threshold = 0.01f);
+                     float                            vad_threshold = 0.01f,
+                     int                              mic_device    = -1);
     ~WakeWordDetector();
 
     WakeWordDetector(const WakeWordDetector&)            = delete;
@@ -60,6 +63,7 @@ private:
     TriggerCallback         callback_;
     std::vector<std::string> wake_phrases_; // each stored lower-case, punctuation-free
     float                   vad_threshold_;
+    int                     mic_device_;    // PortAudio device index; -1 = default
     std::atomic<bool>       running_;
     std::thread             thread_;
     whisper_context*        ctx_;

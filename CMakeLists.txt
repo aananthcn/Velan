@@ -36,9 +36,10 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm")
 endif()
 
 # ---------------------------------------------------------------------------
-# CUDA support (pass -DGGML_CUDA=ON to enable)
+# AI accelerator support
 # ---------------------------------------------------------------------------
-option(GGML_CUDA "Enable CUDA acceleration for whisper.cpp" OFF)
+option(GGML_CUDA   "Enable CUDA acceleration for whisper.cpp"   OFF)
+option(GGML_HAILO8 "Enable Hailo-8 NPU acceleration"            OFF)
 
 if(GGML_CUDA)
     set(CMAKE_CUDA_STANDARD          17 CACHE STRING "" FORCE)
@@ -65,56 +66,51 @@ if(GGML_CUDA)
             "Install: sudo apt install cuda-toolkit-12-8")
     endif()
     message(STATUS "CUDA ${CUDAToolkit_VERSION} enabled — architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+elseif(GGML_HAILO8)
+    message(STATUS "Hailo-8 NPU inference enabled (SDK must be installed manually on target)")
 else()
-    message(STATUS "CUDA disabled — CPU inference (use -DGGML_CUDA=ON for GPU)")
+    message(STATUS "CPU inference")
 endif()
 
 # ---------------------------------------------------------------------------
-# Dependencies fetched at configure time
+# Dependencies — all managed by Conan.
+# Run `conan install` (via build_velan.sh) before invoking cmake directly.
 # ---------------------------------------------------------------------------
-include(FetchContent)
+find_package(gRPC          CONFIG REQUIRED)
+find_package(Protobuf      CONFIG REQUIRED)
+# portaudio: prefer the system library on native builds (Ubuntu's package is
+# compiled with ALSA + PulseAudio and works with PipeWire out of the box).
+# Fall back to the Conan package for RPi cross-compilation where the system
+# portaudio is not available in the sysroot.
+find_package(PkgConfig QUIET)
+pkg_check_modules(portaudio_pc QUIET IMPORTED_TARGET portaudio-2.0)
+if(portaudio_pc_FOUND AND NOT CMAKE_CROSSCOMPILING)
+    message(STATUS "portaudio: system library ${portaudio_pc_VERSION}")
+    add_library(portaudio INTERFACE IMPORTED GLOBAL)
+    target_link_libraries(portaudio INTERFACE PkgConfig::portaudio_pc)
+else()
+    find_package(portaudio CONFIG REQUIRED)
+    message(STATUS "portaudio: Conan package")
+endif()
+find_package(CURL                 REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
+find_package(whisper       CONFIG REQUIRED)
+find_package(OpenMP               REQUIRED)
 
-# whisper.cpp
-FetchContent_Declare(
-    whisper
-    GIT_REPOSITORY https://github.com/ggerganov/whisper.cpp.git
-    GIT_TAG        v1.7.4
-    GIT_SHALLOW    TRUE
-)
-set(WHISPER_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
-set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(whisper)
+# protoc and grpc_cpp_plugin: build-machine executables exposed via
+# Conan's VirtualBuildEnv. build_velan.sh sources conanbuild.sh before
+# invoking cmake so find_program resolves them from the Conan package cache.
+find_program(PROTOC_EXE          protoc          REQUIRED)
+find_program(GRPC_CPP_PLUGIN_EXE grpc_cpp_plugin REQUIRED)
+message(STATUS "protoc:          ${PROTOC_EXE}")
+message(STATUS "grpc_cpp_plugin: ${GRPC_CPP_PLUGIN_EXE}")
 
-# nlohmann/json — header-only JSON
-FetchContent_Declare(
-    nlohmann_json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG        v3.11.3
-    GIT_SHALLOW    TRUE
-)
-FetchContent_MakeAvailable(nlohmann_json)
-
-# ---------------------------------------------------------------------------
-# System libraries: PortAudio + libcurl
-# ---------------------------------------------------------------------------
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(PORTAUDIO REQUIRED portaudio-2.0)
-
-find_package(CURL REQUIRED)
-
-# ---------------------------------------------------------------------------
-# gRPC + Protobuf
-# Install deps: sudo apt install libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc
-# ---------------------------------------------------------------------------
-find_package(Protobuf REQUIRED)
-
-# Ubuntu apt ships gRPC without a CMake config file; use pkg-config instead.
-pkg_check_modules(GRPC REQUIRED IMPORTED_TARGET grpc++)
-message(STATUS "Found gRPC via pkg-config")
-
-find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin REQUIRED
-    HINTS /usr/bin /usr/local/bin)
-message(STATUS "grpc_cpp_plugin: ${GRPC_CPP_PLUGIN}")
+# Protobuf include dirs for the protoc -I flag (google/protobuf well-known types).
+get_target_property(_proto_incdirs protobuf::libprotobuf INTERFACE_INCLUDE_DIRECTORIES)
+set(PROTOC_INCLUDE_ARGS "")
+foreach(_d ${_proto_incdirs})
+    list(APPEND PROTOC_INCLUDE_ARGS "-I${_d}")
+endforeach()
 
 # ---------------------------------------------------------------------------
 # VHAL proto code generation — proto files live in vhal-core, not here
@@ -158,11 +154,11 @@ foreach(PROTO_REL IN LISTS VHAL_MSG_PROTOS)
         OUTPUT
             "${OUT_DIR}/${PROTO_NAME}.pb.cc"
             "${OUT_DIR}/${PROTO_NAME}.pb.h"
-        COMMAND ${Protobuf_PROTOC_EXECUTABLE}
+        COMMAND ${PROTOC_EXE}
         ARGS
             "--cpp_out=${VHAL_PROTO_GEN_DIR}"
             "-I${VHAL_PROTO_DIR}"
-            "-I${Protobuf_INCLUDE_DIRS}"
+            ${PROTOC_INCLUDE_ARGS}
             "${VHAL_PROTO_DIR}/${PROTO_REL}"
         DEPENDS "${VHAL_PROTO_DIR}/${PROTO_REL}"
         VERBATIM
@@ -177,13 +173,13 @@ add_custom_command(
         "${VHAL_PROTO_GEN_DIR}/VehicleServer.pb.h"
         "${VHAL_PROTO_GEN_DIR}/VehicleServer.grpc.pb.cc"
         "${VHAL_PROTO_GEN_DIR}/VehicleServer.grpc.pb.h"
-    COMMAND ${Protobuf_PROTOC_EXECUTABLE}
+    COMMAND ${PROTOC_EXE}
     ARGS
         "--cpp_out=${VHAL_PROTO_GEN_DIR}"
         "--grpc_out=${VHAL_PROTO_GEN_DIR}"
-        "--plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}"
+        "--plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN_EXE}"
         "-I${VHAL_PROTO_DIR}"
-        "-I${Protobuf_INCLUDE_DIRS}"
+        ${PROTOC_INCLUDE_ARGS}
         "${VHAL_PROTO_DIR}/VehicleServer.proto"
     DEPENDS "${VHAL_PROTO_DIR}/VehicleServer.proto"
     VERBATIM
@@ -197,7 +193,7 @@ add_library(velan_proto STATIC ${VHAL_PROTO_SRCS})
 target_include_directories(velan_proto PUBLIC "${VHAL_PROTO_GEN_DIR}")
 target_link_libraries(velan_proto PUBLIC
     protobuf::libprotobuf
-    PkgConfig::GRPC
+    gRPC::grpc++
 )
 
 # ---------------------------------------------------------------------------
@@ -211,20 +207,21 @@ add_executable(velan
     src/WakeWordDetector.cpp
 )
 
-target_include_directories(velan PRIVATE
-    ${whisper_SOURCE_DIR}
-    ${PORTAUDIO_INCLUDE_DIRS}
-)
-
 target_link_libraries(velan PRIVATE
-    whisper
-    ${PORTAUDIO_LIBRARIES}
+    whisper::whisper
+    OpenMP::OpenMP_CXX
+    portaudio
     CURL::libcurl
     nlohmann_json::nlohmann_json
     velan_proto
 )
 
-target_link_options(velan PRIVATE ${PORTAUDIO_LDFLAGS_OTHER})
+if(GGML_CUDA)
+    # /usr/local/cuda/lib64 is not in the compiler's default search path,
+    # so -lcudart/-lcublas/-lcublasLt/-lcuda (injected by the whisper Conan
+    # package as system_libs) would fail without this -L.
+    target_link_directories(velan PRIVATE ${CUDAToolkit_LIBRARY_DIR})
+endif()
 
 # ---------------------------------------------------------------------------
 # Install

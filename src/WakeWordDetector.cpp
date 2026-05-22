@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "WakeWordDetector.h"
+#include "log.h"
 
 #include <algorithm>
 #include <cctype>
@@ -20,6 +21,7 @@
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 #include <portaudio.h>
 
@@ -42,8 +44,8 @@ static constexpr int MIN_PHRASE_FRAMES  = SAMPLE_RATE * MIN_PHRASE_MS / 1000; //
 static constexpr int MAX_BUFFER_MS      = 5000;
 static constexpr int MAX_BUFFER_FRAMES  = SAMPLE_RATE * MAX_BUFFER_MS / 1000; // 80 000
 
-// Fewer Whisper threads than the STT path; wake word detection is lightweight.
-static constexpr int WWD_THREADS = 2;
+// With GPU the thread count doesn't matter for inference; on CPU use more cores.
+static const int WWD_THREADS = std::max(4, static_cast<int>(std::thread::hardware_concurrency() / 2));
 
 
 // ---------------------------------------------------------------------------
@@ -71,6 +73,16 @@ static std::string transcribe_window(whisper_context* ctx,
         const char* s = whisper_full_get_segment_text(ctx, i);
         if (s) out += s;
     }
+
+    // Whisper hallucinates stereotype phrases on silence/noise. Discard them
+    // so ambient sound never accidentally triggers a phrase match.
+    static const char* kNoise[] = {
+        "(", "[", "Thank you", "Thanks for watching", "you"
+    };
+    for (const char* pat : kNoise) {
+        if (out.find(pat) != std::string::npos) return {};
+    }
+
     return out;
 }
 
@@ -81,9 +93,11 @@ static std::string transcribe_window(whisper_context* ctx,
 WakeWordDetector::WakeWordDetector(TriggerCallback                  cb,
                                    whisper_context*                 ctx,
                                    const std::vector<std::string>&  wake_phrases,
-                                   float                            vad_threshold)
+                                   float                            vad_threshold,
+                                   int                              mic_device)
     : callback_(std::move(cb)),
       vad_threshold_(vad_threshold),
+      mic_device_(mic_device),
       running_(false),
       ctx_(ctx),
       stt_active_(false) {
@@ -162,7 +176,7 @@ bool WakeWordDetector::phrase_matches(const std::string& text) const {
     if (text.empty()) return false;
     if (text.find("[BLANK_AUDIO]") != std::string::npos) return false;
 
-    std::cout << "[WakeWord] Heard: \"" << text << "\"\n";
+    std::cout << log_ts() << "[WakeWord] Heard: \"" << text << "\"\n";
 
     std::string normalised;
     normalised.reserve(text.size());
@@ -208,12 +222,41 @@ void WakeWordDetector::detect_loop() {
     PaStream* stream = nullptr;
 
     auto open_stream = [&]() -> bool {
-        PaError err = Pa_OpenDefaultStream(&stream, 1, 0, paFloat32,
-                                           SAMPLE_RATE, CHUNK_FRAMES,
-                                           nullptr, nullptr);
-        if (err != paNoError) { stream = nullptr; return false; }
+        PaDeviceIndex dev = (mic_device_ >= 0)
+                            ? static_cast<PaDeviceIndex>(mic_device_)
+                            : Pa_GetDefaultInputDevice();
+        if (dev == paNoDevice) {
+            std::cerr << log_ts() << "[WakeWord] No input device available.\n";
+            return false;
+        }
+        const PaDeviceInfo* info = Pa_GetDeviceInfo(dev);
+
+        PaStreamParameters p{};
+        p.device                    = dev;
+        p.channelCount              = 1;
+        p.sampleFormat              = paFloat32;
+        p.suggestedLatency          = info ? info->defaultLowInputLatency : 0.1;
+        p.hostApiSpecificStreamInfo = nullptr;
+
+        PaError err = Pa_OpenStream(&stream, &p, nullptr, SAMPLE_RATE,
+                                    CHUNK_FRAMES, paClipOff, nullptr, nullptr);
+        if (err != paNoError) {
+            std::cerr << log_ts() << "[WakeWord] Pa_OpenStream failed (device " << dev
+                      << "): " << Pa_GetErrorText(err) << "\n";
+            stream = nullptr;
+            return false;
+        }
         err = Pa_StartStream(stream);
-        if (err != paNoError) { Pa_CloseStream(stream); stream = nullptr; return false; }
+        if (err != paNoError) {
+            std::cerr << log_ts() << "[WakeWord] Pa_StartStream failed: "
+                      << Pa_GetErrorText(err) << "\n";
+            Pa_CloseStream(stream);
+            stream = nullptr;
+            return false;
+        }
+        std::cout << log_ts() << "[WakeWord] Microphone opened"
+                  << (info ? std::string(": ") + info->name : "")
+                  << " — listening for wake phrase.\n";
         return true;
     };
 
@@ -235,13 +278,13 @@ void WakeWordDetector::detect_loop() {
                 silence_chunks = 0;
                 std::unique_lock<std::mutex> lk(mutex_);
                 cv_.wait(lk, [this] { return !stt_active_ || !running_.load(); });
-                std::cout << "[WakeWord] STT done — resuming detection.\n";
+                std::cout << log_ts() << "[WakeWord] STT done — resuming detection.\n";
                 continue;
             }
         }
 
         if (!stream && !open_stream()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;
         }
 
@@ -273,7 +316,7 @@ void WakeWordDetector::detect_loop() {
                 std::string text = transcribe_window(ctx_, speech_buf);
                 if (phrase_matches(text)) {
                     close_stream();
-                    std::cout << "[WakeWord] Phrase matched — handing off to STT.\n";
+                    std::cout << log_ts() << "[WakeWord] Phrase matched — handing off to STT.\n";
                     {
                         std::lock_guard<std::mutex> lk(mutex_);
                         stt_active_ = true;
@@ -284,7 +327,7 @@ void WakeWordDetector::detect_loop() {
                         std::unique_lock<std::mutex> lk(mutex_);
                         cv_.wait(lk, [this] { return !stt_active_ || !running_.load(); });
                     }
-                    std::cout << "[WakeWord] STT done — resuming detection.\n";
+                    std::cout << log_ts() << "[WakeWord] STT done — resuming detection.\n";
                 }
             }
             speech_buf.clear();

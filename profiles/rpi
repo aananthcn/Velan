@@ -1,0 +1,13 @@
+# Conan host profile — Raspberry Pi 5 (aarch64 / armv8, GCC 11).
+# Use with: --profile:host=profiles/rpi --profile:build=profiles/pc
+[settings]
+os=Linux
+arch=armv8
+compiler=gcc
+compiler.version=11
+compiler.libcxx=libstdc++11
+compiler.cppstd=17
+build_type=Release
+
+[conf]
+tools.build:compiler_executables={"c": "aarch64-linux-gnu-gcc", "cpp": "aarch64-linux-gnu-g++", "strip": "aarch64-linux-gnu-strip"}
