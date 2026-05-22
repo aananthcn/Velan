@@ -27,12 +27,15 @@ static const int   CHUNK_FRAMES       = 1024;
 static const int   WHISPER_THREADS    = 4;
 
 // VAD parameters for end-of-speech detection inside record_audio().
-static constexpr float VAD_RMS_THRESHOLD     = 0.02f;  // minimum floor; adaptive threshold overrides
-static constexpr float VAD_NOISE_MULTIPLIER  = 4.0f;   // speech must be 4× the ambient noise floor
-static constexpr int   VAD_NOISE_CAL_CHUNKS  = 5;      // calibrate noise floor over first ~320 ms
-static constexpr int   VAD_SILENCE_CHUNKS    = 15;     // ~960 ms of silence ends recording
-static constexpr int   VAD_MIN_SPEECH_CHUNKS = 5;      // must see ~320 ms of speech first
-static constexpr int   VAD_MAX_RECORD_FRAMES = SAMPLE_RATE * 45; // hard cap: 45 s
+static constexpr float VAD_RMS_THRESHOLD        = 0.02f;  // minimum threshold floor
+static constexpr float VAD_NOISE_MULTIPLIER     = 3.0f;   // speech must be 3× the ambient noise floor
+static constexpr float VAD_THRESHOLD_MAX        = 0.10f;  // cap: prevents noisy rooms from setting
+                                                           // threshold above normal speech levels
+static constexpr int   VAD_NOISE_CAL_CHUNKS     = 5;      // calibrate noise floor over first ~320 ms
+static constexpr int   VAD_SILENCE_CHUNKS       = 20;     // ~1.3 s of silence ends recording
+static constexpr int   VAD_MIN_SPEECH_CHUNKS    = 5;      // must see ~320 ms of speech first
+static constexpr int   VAD_NO_SPEECH_TIMEOUT    = 125;    // abort after ~8 s if speech never starts
+static constexpr int   VAD_MAX_RECORD_FRAMES    = SAMPLE_RATE * 30; // hard cap: 30 s
 
 extern volatile bool g_interrupted;
 
@@ -107,7 +110,8 @@ static std::vector<float> record_audio(std::atomic<bool>& stop_flag, int mic_dev
             ++cal_chunks;
             if (cal_chunks == VAD_NOISE_CAL_CHUNKS) {
                 noise_floor  /= VAD_NOISE_CAL_CHUNKS;
-                vad_threshold = std::max(VAD_RMS_THRESHOLD, noise_floor * VAD_NOISE_MULTIPLIER);
+                vad_threshold = std::min(VAD_THRESHOLD_MAX,
+                                std::max(VAD_RMS_THRESHOLD, noise_floor * VAD_NOISE_MULTIPLIER));
                 std::cout << log_ts() << "[Velan] Noise floor: " << noise_floor
                           << "  VAD threshold: " << vad_threshold << "\n";
             }
@@ -123,6 +127,13 @@ static std::vector<float> record_audio(std::atomic<bool>& stop_flag, int mic_dev
         } else if (speech_started) {
             if (++silence_chunks >= VAD_SILENCE_CHUNKS) {
                 std::cout << log_ts() << "[Velan] End of speech detected.\n";
+                break;
+            }
+        } else {
+            // Speech has never started — abort if user isn't speaking after timeout.
+            ++silence_chunks;
+            if (silence_chunks >= VAD_NO_SPEECH_TIMEOUT) {
+                std::cout << log_ts() << "[Velan] No speech detected — stopping.\n";
                 break;
             }
         }

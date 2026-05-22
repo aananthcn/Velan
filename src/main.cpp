@@ -45,8 +45,16 @@ static const char* DEFAULT_OLLAMA_MODEL   = "llama3.2:3b";
 static const char* DEFAULT_VHAL_SERVER    = "localhost:50051";
 static const char* DEFAULT_WAKEWORD_PHRASE = WWD_DEFAULT_WAKE_WORDS;
 
+
 // Poll interval for GetValues (milliseconds). 10 Hz matches vhal-gateway.
 static const int POLL_INTERVAL_MS = 100;
+
+
+// Application-level singletons — one of each for the process lifetime.
+static std::unique_ptr<TransformerManager> g_llm;
+static std::unique_ptr<Text2SpeechManager> g_tts;
+static std::unique_ptr<WakeWordDetector>   g_wwd;
+
 
 // Vendor-defined VHAL property for voice assistant trigger.
 // Encoding: VehiclePropertyGroup::VENDOR (0x20000000)
@@ -198,6 +206,26 @@ static std::vector<std::string> split_phrases(const std::string& s) {
 
 
 // ---------------------------------------------------------------------------
+// Run the LLM + TTS pipeline, then resume wake-word detection.
+// Called by Speech2TextManager via the on_transcript callback after Whisper
+// finishes transcribing. Empty text means silence/error — still resumes WWD.
+// ---------------------------------------------------------------------------
+static void chat_with_ai_model(const std::string& text) {
+    if (!text.empty()) {
+        try {
+            std::cout << log_ts() << "[Velan] Thinking...\n";
+            std::string reply = g_llm->chat(text);
+            std::cout << log_ts() << "[Velan] Assistant: " << reply << "\n\n";
+            g_tts->speak(reply);
+        } catch (const std::exception& e) {
+            std::cerr << log_ts() << "[Velan] Ollama error: " << e.what() << "\n";
+        }
+    }
+    if (g_wwd) g_wwd->resume();     // PROCESSING → LISTENING
+}
+
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
@@ -224,31 +252,16 @@ int main(int argc, char* argv[]) {
                   << " (use --list-mic to list devices)\n";
     std::cout << "[Velan] =====================================\n";
 
-    // wwd declared before STT so the on_start/on_done lambdas can capture it.
-    std::unique_ptr<WakeWordDetector> wwd;
-
-    TransformerManager  transformer(cfg.ollama_model);
-    Text2SpeechManager  tts(cfg.tts_model);
+    g_llm = std::make_unique<TransformerManager>(cfg.ollama_model);
+    g_tts = std::make_unique<Text2SpeechManager>(cfg.tts_model);
 
     // ---- STT: loads the Whisper model (context shared with WWD) ----
     Speech2TextManager* mgr_ptr;
     try {
         mgr_ptr = &Speech2TextManager::instance(
             cfg.stt_model.c_str(),
-            [&wwd]() { if (wwd) wwd->pause(); },           // LISTENING → PROCESSING
-            [&transformer, &tts, &wwd](const std::string& text) {
-                if (!text.empty()) {
-                    try {
-                        std::cout << log_ts() << "[Velan] Thinking...\n";
-                        std::string reply = transformer.chat(text);
-                        std::cout << log_ts() << "[Velan] Assistant: " << reply << "\n\n";
-                        tts.speak(reply);
-                    } catch (const std::exception& e) {
-                        std::cerr << log_ts() << "[Velan] Ollama error: " << e.what() << "\n";
-                    }
-                }
-                if (wwd) wwd->resume();                     // PROCESSING → LISTENING
-            },
+            []()                        { if (g_wwd) g_wwd->pause(); },   // LISTENING → PROCESSING
+            [](const std::string& text) { chat_with_ai_model(text);  },   // transcript → LLM → TTS → resume
             cfg.mic_device
         );
     } catch (const std::exception& e) {
@@ -259,18 +272,18 @@ int main(int argc, char* argv[]) {
 
     // ---- WWD: shares STT's whisper_context — no second model loaded ----
     try {
-        wwd = std::make_unique<WakeWordDetector>(
+        g_wwd = std::make_unique<WakeWordDetector>(
             [&mgr]() { mgr.handle_trigger(); },        // LISTENING → PROCESSING
             mgr.get_context(),
             split_phrases(cfg.wakeword_phrase),
             0.01f,
             cfg.mic_device
         );
-        wwd->start();
+        g_wwd->start();
     } catch (const std::exception& e) {
         std::cerr << "[Velan] Wake word detector failed to start: " << e.what() << "\n";
         std::cerr << "[Velan] Continuing with VHAL trigger only.\n";
-        wwd.reset();
+        g_wwd.reset();
     }
 
     // ---- VHAL gRPC polling loop ----
@@ -332,7 +345,7 @@ int main(int argc, char* argv[]) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    if (wwd) wwd->stop();
+    if (g_wwd) g_wwd->stop();
 
     std::cout << "[Velan] Bye.\n";
     return 0;

@@ -186,21 +186,87 @@ Velan start-up
 
 ## VAD Parameters
 
-### WakeWordDetector
-| Parameter | Value | Meaning |
-|-----------|-------|---------|
-| `CHUNK_MS` | 100 ms | mic poll interval |
-| `END_SILENCE_CHUNKS` | 5 | 500 ms trailing silence ends utterance |
-| `MIN_PHRASE_FRAMES` | — | 200 ms minimum speech before transcribing |
-| `MAX_BUFFER_MS` | 5000 ms | hard cap on accumulated speech buffer |
+Both components use energy-based Voice Activity Detection (VAD): they compute the
+RMS (root-mean-square) of each audio chunk and compare it against a threshold to
+decide whether speech is present.
 
-### Speech2TextManager
+### WakeWordDetector (`src/WakeWordDetector.cpp`)
+
 | Parameter | Value | Meaning |
 |-----------|-------|---------|
-| `VAD_RMS_THRESHOLD` | 0.01 | energy floor for speech detection |
-| `VAD_MIN_SPEECH_CHUNKS` | 5 | ~320 ms speech required before silence counting |
-| `VAD_SILENCE_CHUNKS` | 15 | ~960 ms sustained silence ends recording |
-| `VAD_MAX_RECORD_FRAMES` | 90 s | hard cap; guards against VAD failure in noisy environments |
+| `CHUNK_MS` | 100 ms | mic poll interval; one VAD decision per chunk |
+| `END_SILENCE_CHUNKS` | 5 | 5 × 100 ms = 500 ms of trailing silence ends the utterance |
+| `MIN_PHRASE_FRAMES` | 3200 samples | 200 ms of speech required before Whisper is invoked; ignores very short noise bursts |
+| `MAX_BUFFER_MS` | 5000 ms | hard cap on accumulated speech; prevents unbounded memory if silence is never detected |
+| `vad_threshold` | 0.01 (default) | fixed RMS threshold passed in from `main.cpp`; controls sensitivity |
+
+WWD uses a **fixed threshold** because it only needs to detect whether any sound
+is present — the phrase match itself (Whisper + substring check) provides the
+true signal. False positives in VAD just cause an extra Whisper call, not a
+false trigger.
+
+### Speech2TextManager (`src/Speech2TextManager.cpp`)
+
+STT uses an **adaptive threshold** because it must reliably detect *end of
+speech* in environments with varying background noise. A fixed threshold that
+works in a quiet room will fail in a car cabin or open-plan office.
+
+#### Calibration phase
+
+At the start of each recording, the first `VAD_NOISE_CAL_CHUNKS` audio chunks
+are used to measure the ambient noise level:
+
+```
+noise_floor  = average RMS over the calibration window
+vad_threshold = clamp(noise_floor × VAD_NOISE_MULTIPLIER,
+                      VAD_RMS_THRESHOLD,       ← floor
+                      VAD_THRESHOLD_MAX)        ← ceiling
+```
+
+The result is logged as:
+```
+[Velan] Noise floor: 0.031  VAD threshold: 0.093
+```
+
+#### Parameters
+
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `VAD_NOISE_CAL_CHUNKS` | 5 | ~320 ms of audio used to measure ambient noise at the start of each recording |
+| `VAD_RMS_THRESHOLD` | 0.02 | minimum threshold floor — ensures the adaptive value never drops so low that background hiss triggers speech |
+| `VAD_NOISE_MULTIPLIER` | 3.0 | speech must be 3× louder than the ambient noise floor to register as speech |
+| `VAD_THRESHOLD_MAX` | 0.10 | ceiling — prevents the threshold from rising so high that normal speech (typically 0.05–0.20 RMS) is never detected in loud rooms |
+| `VAD_MIN_SPEECH_CHUNKS` | 5 | ~320 ms of audio above threshold required before the silence counter starts; avoids reacting to a single noise spike |
+| `VAD_SILENCE_CHUNKS` | 20 | 20 chunks × 64 ms ≈ 1.3 s of continuous silence after speech ends the recording; the longer window tolerates occasional noise spikes in the post-speech period |
+| `VAD_NO_SPEECH_TIMEOUT` | 125 | ~8 s limit: if speech never starts after calibration (e.g. accidental wake-word trigger), recording is aborted instead of running to the hard cap |
+| `VAD_MAX_RECORD_FRAMES` | 30 s | absolute hard cap; guards against VAD failure in extreme noise conditions |
+
+#### Why the ceiling matters (VAD_THRESHOLD_MAX)
+
+Without a ceiling, a loud background (noise floor ≈ 0.088) would set the threshold
+to `0.088 × 3 = 0.264`. Normal conversational speech typically reaches 0.10–0.20
+RMS — below 0.264 — so the VAD would never see any speech, `speech_started`
+would never be set, and recording would run all the way to the 30 s hard cap.
+
+The ceiling at 0.10 ensures that in any environment where it is physically
+possible to hear the wake word, it is also possible to detect the subsequent
+speech.
+
+#### Recording termination logic
+
+```
+After calibration, for each chunk:
+
+  rms ≥ vad_threshold?
+  ├── YES → speech_chunks++; silence_chunks = 0
+  │         speech_started = (speech_chunks ≥ VAD_MIN_SPEECH_CHUNKS)
+  │
+  └── NO, speech_started = true  → silence_chunks++
+  │         silence_chunks ≥ VAD_SILENCE_CHUNKS? → END OF SPEECH ✓
+  │
+  └── NO, speech_started = false → silence_chunks++
+            silence_chunks ≥ VAD_NO_SPEECH_TIMEOUT? → NO SPEECH DETECTED ✓
+```
 
 ---
 
