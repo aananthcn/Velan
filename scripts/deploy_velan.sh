@@ -103,9 +103,10 @@ info "TTS models   : models/tts/"
 info "Deploy root  : ${DEPLOY_ROOT}"
 
 # Runtime packages Velan needs on the target machine.
+# Note: libcurl4 was renamed to libcurl4t64 in Ubuntu 24.04.
+# We check for both — if either is installed the dependency is satisfied.
 RUNTIME_DEPS=(
     libportaudio2       # PortAudio — microphone and speaker I/O
-    libcurl4            # HTTP client — Ollama LLM API
     libgomp1            # OpenMP runtime — whisper.cpp multi-threading
 )
 
@@ -131,6 +132,21 @@ install_runtime_deps() {
                 || missing+=("$pkg")
         fi
     done
+    # libcurl: Ubuntu 22.04 uses libcurl4; Ubuntu 24.04 renamed it libcurl4t64.
+    # Check for either — only add to missing if neither is present.
+    local curl_ok=false
+    for cpkg in libcurl4t64 libcurl4; do
+        if [[ -z "$dest" ]]; then
+            dpkg-query -W -f='${Status}' "$cpkg" 2>/dev/null \
+                | grep -q "install ok installed" && curl_ok=true && break
+        else
+            ssh "${dest}" \
+                "dpkg-query -W -f='\${Status}' '$cpkg' 2>/dev/null \
+                 | grep -q 'install ok installed'" 2>/dev/null \
+                && curl_ok=true && break
+        fi
+    done
+    $curl_ok || missing+=("libcurl4t64")
 
     if [[ ${#missing[@]} -eq 0 ]]; then
         success "All runtime dependencies already installed."

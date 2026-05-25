@@ -10,4 +10,6 @@ compiler.cppstd=17
 build_type=Release
 
 [conf]
-tools.build:compiler_executables={"c": "aarch64-linux-gnu-gcc", "cpp": "aarch64-linux-gnu-g++", "strip": "aarch64-linux-gnu-strip"}
+# Absolute paths prevent CMake's internal find_program() from accidentally
+# picking up the ARM64 cross-compiler binaries inside the RPi sysroot.
+tools.build:compiler_executables={"c": "/usr/bin/aarch64-linux-gnu-gcc", "cpp": "/usr/bin/aarch64-linux-gnu-g++", "strip": "/usr/bin/aarch64-linux-gnu-strip"}

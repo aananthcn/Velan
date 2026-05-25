@@ -14,22 +14,23 @@
 
 #pragma once
 
+#include "Transcriber.h"
+
 #include <atomic>
 #include <functional>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include <whisper.h>
-
 
 class Speech2TextManager {
 public:
+    // transcriber:   shared backend (WhisperTranscriber or HailoTranscriber).
     // on_start:      called before recording begins — use it to pause WakeWordDetector.
     // on_transcript: called with the transcript after transcription completes (empty
     //                string on silence/error). Caller owns LLM, TTS, and the
     //                PROCESSING → LISTENING transition (wwd->resume()).
-    static Speech2TextManager& instance(const char* stt_model_path,
+    static Speech2TextManager& instance(ITranscriber* transcriber,
                                         std::function<void()> on_start,
                                         std::function<void(const std::string&)> on_transcript,
                                         int mic_device = -1);
@@ -37,24 +38,20 @@ public:
     Speech2TextManager(const Speech2TextManager&)            = delete;
     Speech2TextManager& operator=(const Speech2TextManager&) = delete;
 
-    // Starts the PROCESSING pipeline: record → transcribe → LLM → TTS → on_done.
+    // Starts the PROCESSING pipeline: record → transcribe → on_transcript.
     // No-op if already recording.
     void handle_trigger();
 
-    // Exposes the loaded Whisper context so WakeWordDetector can share it.
-    whisper_context* get_context() const { return ctx_; }
-
 private:
-    Speech2TextManager(const char* stt_model_path,
+    Speech2TextManager(ITranscriber* transcriber,
                        std::function<void()> on_start,
                        std::function<void(const std::string&)> on_transcript,
-                       int mic_device = -1);
+                       int mic_device);
     ~Speech2TextManager();
 
     std::string process();
 
-    whisper_context_params                    wparams_;
-    whisper_context*                          ctx_;
+    ITranscriber*                             transcriber_;   // non-owning
     std::function<void()>                     on_start_;
     std::function<void(const std::string&)>   on_transcript_;
 

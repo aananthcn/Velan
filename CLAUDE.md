@@ -130,10 +130,22 @@ The `split_phrases()` helper in `main.cpp` handles the comma-split and whitespac
 ## VAD parameters
 
 ### WakeWordDetector (detect_loop)
-- `CHUNK_MS = 100` — mic poll interval
-- `END_SILENCE_CHUNKS = 5` — 500 ms of trailing silence ends a speech utterance
-- `MIN_PHRASE_FRAMES` — minimum 200 ms of speech before transcribing
-- `MAX_BUFFER_MS = 5000` — hard cap on accumulated speech buffer
+
+**Design**: onset-triggered fixed-duration capture (not VAD-based end detection).
+
+Simple threshold VAD is unreliable at the SNR typical in home/car environments: mid-word
+phonemes ("ubramanya" after the onset "S") fall below the detection threshold and produce
+mostly-silent buffers that Whisper hallucinates on.  The fix: once any chunk exceeds
+`eff_threshold`, collect ALL chunks for `LOCK_IN_MS` regardless of per-chunk energy.
+
+- `CHUNK_MS = 100` — mic poll interval; `CHUNK_FRAMES = 1600`
+- `LOCK_IN_MS = 1000` / `LOCK_IN_FRAMES = 16000` — fixed capture window after onset; covers the longest expected wake phrase ("Subrahmanya" ≈ 700 ms) with headroom
+- `MIN_PHRASE_MS = 200` / `MIN_PHRASE_FRAMES = 3200` — safety floor (always satisfied with 1000 ms capture)
+- `WWD_NOISE_CAL_CHUNKS = 5` — calibration duration (~500 ms)
+- `WWD_NOISE_MULTIPLIER = 1.2f` — `eff_threshold = median(cal_rms) × 1.2`; capped at `WWD_THRESHOLD_MAX = 0.10f`
+- **Median calibration**: individual calibration chunk RMS values are sorted and the median is used as the noise floor estimate. This rejects startup transient spikes (keyboard, AC click) that inflate a mean-based estimate and raise `eff_threshold` too high.
+- `audio_ctx = 128` mel frames (~1.28 s) — limits Whisper encoder context for faster CPU inference
+- `MIN_SAMPLES = SAMPLE_RATE + CHUNK_FRAMES` (17600, 1100 ms) — padding floor in WhisperTranscriber; whisper's mel-frame formula rounds exactly-1s audio down to 990ms and rejects it
 
 ### Speech2TextManager (record_audio)
 - `VAD_RMS_THRESHOLD = 0.01f`
@@ -153,6 +165,145 @@ Sends `SetValues(VOICE_ASSIST_TRIGGER)` to VHAL to simulate a hardware button.
 
 This is **not** hold-to-talk. It was changed from the original auto-repeat / release-timeout
 pattern to a press-to-start / press-to-stop pattern because STT now self-terminates via VAD.
+
+---
+
+## Phase 2 — Hailo-8L NPU acceleration
+
+`HailoTranscriber` implements `ITranscriber` using the HailoRT C++ InferModel API.
+It replaces whisper.cpp CPU/GPU inference entirely with NPU inference on the Hailo-8L.
+
+### Architecture
+```
+transcribe(pcm)
+  ├─ log_mel(pcm)               CPU: FFT + mel filterbank + log normalisation
+  ├─ run_encoder(mel)           NPU: encoder.hef (one shot, ~3000 mel frames in)
+  ├─ greedy_decode(enc_out):    NPU: decoder.hef (autoregressive until EOT)
+  │    for each step:
+  │      run_decoder_step(enc_out, tokens) → next_token = argmax(logits)
+  └─ detokenise(token_ids)      CPU: BPE vocab.json lookup
+```
+
+### Setup: HEF files + matmul-split weights
+1. Drop `encoder.hef` and `decoder.hef` in `models/stt/`
+2. Run `hailortcli parse-hef models/stt/encoder.hef` — note the **exact stream names**
+3. Update `ENCODER_INPUT_NAME`, `ENCODER_OUTPUT_NAME`, `DECODER_INPUT_ENC`,
+   `DECODER_INPUT_TOKS`, `DECODER_OUTPUT_NAME` at the top of `src/HailoTranscriber.cpp`
+4. Verify mel layout matches encoder input shape — the tiny HEF encoder input is
+   `FCR(1×1000×80)` meaning **[frames × mel_bands]**.  `log_mel()` produces
+   `[mel_bands × frames]`, so `run_encoder()` transposes before `set_buffer()`.  If you
+   swap in a different HEF, re-check this with `hailortcli parse-hef` and update the
+   transpose if the shape changes.
+5. Check decoder token dtype (float32 or int32 — see TODO in `decoder_step()`)
+6. Extract embedding weights, mel filterbank, and `vocab.json` using the extraction script:
+   ```bash
+   # On any machine with openai-whisper installed:
+   python3 scripts/extract_whisper_weights.py --model tiny --out models/stt
+   # (use --model base/small/medium to match the model size the HEF was compiled from)
+   ```
+   This creates:
+   - `models/stt/token_embedding_weight_tiny.npy`  — decoder input embedding [vocab × d_model]
+   - `models/stt/onnx_add_input_tiny.npy`           — positional encoding [max_ctx × d_model]
+   - `models/stt/vocab.json`                        — token_id → UTF-8 string
+   - `models/stt/mel_filters_80.npy`                — whisper's exact mel filterbank [80 × 201]
+
+**Why the .npy files are critical**: the Hailo HEFs use a matmul-split architecture where the
+token embedding lookup (decoder input) and output projection (hidden→logits) are offloaded to
+the CPU.  Without these files the decoder receives raw float token IDs instead of proper
+embeddings, and the output is completely garbage — the decoder will produce timestamp tokens and
+other nonsense regardless of what was spoken.
+
+**vocab.json must be generated with `ensure_ascii=False`** (the script does this automatically).
+The C++ JSON parser uses `nlohmann::json` which handles both forms, but `ensure_ascii=False`
+keeps the file human-readable.  If you regenerate manually, add that flag:
+```python
+json.dump(..., ensure_ascii=False)
+```
+
+### Mel spectrogram — exact whisper compatibility requirements
+
+These details are mandatory for correct Hailo transcription.  Any deviation produces garbage.
+
+**N_FFT = 400, HOP = 160** (not 512).  The whisper ONNX export and the Hailo HEF were
+both compiled from whisper's STFT with `n_fft=400`.
+
+**Mixed-radix FFT** — N=400 = 2⁴×5² is not a power of two.  `fft_inplace()` uses
+Cooley-Tukey radix-2 recursion down to N=25, then a direct DFT-25 (precomputed twiddle
+table in `Dft25Table`).  **Do not replace with a power-of-2 FFT** — that would silently
+zero-pad/truncate and produce wrong mel values.
+
+**Hann window of size N_FFT=400** — matches `torch.hann_window(400)`.
+
+**STFT center=True / reflect padding** — PyTorch's default `torch.stft` uses
+`center=True`, which reflect-pads `N_FFT/2 = 200` samples at both ends so that frame 0
+is centered at sample 0.  `log_mel()` replicates this:
+- prepend 200 samples (reflect of first 200 input samples)
+- append  200 samples (reflect of last  200 input samples)
+Without this, the first few mel frames are systematically wrong.
+
+**O'Shaughnessy mel scale + Slaney normalisation** — whisper uses librosa's default
+`htk=False` mel scale (piecewise-linear at low frequency, log above 1 kHz) with
+`norm='slaney'` (each filter scaled by `2/bandwidth_hz`).  The HTK formula
+`2595*log10(1+f/700)` gives **wrong filter shapes** — peak values ~0.044 vs whisper's
+~0.026.  `HailoTranscriber` loads `mel_filters_80.npy` (whisper's exact filterbank) from
+the weights directory, bypassing the analytical formula entirely.  The analytical
+`hz_to_mel_oshaughnessy()` fallback is only used if the .npy file is missing.
+
+**Mel tensor layout** — `log_mel()` returns a flat vector in row-major
+`[mel_band, frame]` order (80 rows × N_FRAMES cols).  The Hailo encoder input is
+`FCR(1×1000×80)` = `[frame, mel_band]`.  `run_encoder()` transposes the tensor
+before copying to the input buffer.  **Do not skip the transpose** — the encoder will
+accept the wrong-shaped buffer without error but produce random outputs.
+
+**Debugging tip**: set `VELAN_DUMP_MEL=/tmp/mel.bin` before running velan.  The binary
+has a 2×int32 header `[N_MELS, N_FRAMES]` followed by `N_MELS×N_FRAMES` float32 values
+in `[mel_band, frame]` order (pre-transpose).  Compare with Python:
+```python
+import numpy as np, whisper
+model = whisper.load_model("tiny")
+mel = whisper.log_mel_spectrogram("test.wav")  # [80, frames] float32
+```
+
+### Build for RPi + Hailo-8L
+The sysroot is already synced (`~/sdk/rpi/adas`). Build with:
+```
+./scripts/build_velan.sh --target rpi --aicore hailo8
+```
+This sets `-DGGML_HAILO8=ON` which:
+- Finds `libhailort.so` in `~/sdk/rpi/adas/usr/lib`
+- Adds `src/HailoTranscriber.cpp` to the build
+- Links against `libhailort` and defines `GGML_USE_HAILO8`
+
+**ALSA env var required on RPi** when using a conan-built PortAudio:
+```bash
+export ALSA_CONFIG_DIR=/usr/share/alsa
+```
+Without it, PortAudio fails to open the microphone (ALSA cannot find `alsa.conf`).
+
+### Runtime invocation
+```
+ALSA_CONFIG_DIR=/usr/share/alsa \
+./velan --aicore hailo8 \
+        --encoder-hef models/stt/encoder.hef \
+        --decoder-hef models/stt/decoder.hef \
+        --vocab-json  models/stt/vocab.json
+```
+
+### Test mode (offline WAV transcription)
+```
+ALSA_CONFIG_DIR=/usr/share/alsa \
+./velan --aicore hailo8 \
+        --encoder-hef ... --decoder-hef ... --vocab-json ... \
+        --test-wav /tmp/test.wav
+```
+Transcribes the WAV and exits — no mic, TTS, LLM, or VHAL required.  Use with
+`scripts/test_hailo_wav.sh` to generate and copy a known speech WAV from the host.
+
+### Decoder output format
+The tiny HEF decoder emits 4 output tensors with names ending in `_0` through `_3`,
+each shaped `FCR(1×32×vpc)` where vpc≈12966 (vocab split).  `decoder_step()` collects
+all 4 into one contiguous logits vector `[vocab_size]` and takes argmax for greedy
+decoding.  The vocab size must match `token_embedding_weight_tiny.npy` row count.
 
 ---
 

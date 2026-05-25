@@ -21,17 +21,15 @@
 
 using json = nlohmann::json;
 
-static const char* OLLAMA_CHAT_URL = "http://localhost:11434/api/chat";
-
-
 static size_t curl_append(char* ptr, size_t sz, size_t nmemb, void* userdata) {
     static_cast<std::string*>(userdata)->append(ptr, sz * nmemb);
     return sz * nmemb;
 }
 
 
-TransformerManager::TransformerManager(const std::string& model)
-    : model_(model) {
+TransformerManager::TransformerManager(const std::string& model, const std::string& host)
+    : model_(model),
+      chat_url_("http://" + host + ":11434/api/chat") {
     history_ = json::array();
     history_.push_back({
         {"role",    "system"},
@@ -58,7 +56,7 @@ std::string TransformerManager::chat(const std::string& user_text) {
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, "Content-Type: application/json");
 
-    curl_easy_setopt(curl, CURLOPT_URL,           OLLAMA_CHAT_URL);
+    curl_easy_setopt(curl, CURLOPT_URL,           chat_url_.c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    body_str.c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body_str.size()));
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER,    headers);

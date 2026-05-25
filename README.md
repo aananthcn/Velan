@@ -165,6 +165,39 @@ Both vhal-core and Velan are deployed to `/opt/car-ui/` on the target:
 
 ---
 
+### Quick start — do_all.sh
+
+`do_all.sh` runs the full **build → deploy → run** chain for Velan in one command.
+It does not touch vhal-core — build that once with steps 1–2 below.
+
+Default AI accelerators: **CUDA** for `--target pc`, **Hailo-8** for `--target rpi`.
+The deploy confirmation prompt is auto-answered.
+
+```bash
+# PC — full build + deploy + run (CUDA by default)
+./scripts/do_all.sh --target pc
+
+# PC — override to CPU, pass a specific model to velan
+./scripts/do_all.sh --target pc --aicore cpu --sttmodel models/stt/ggml-tiny.bin
+
+# RPi — full build + deploy + run (Hailo-8 by default)
+./scripts/do_all.sh --target rpi --ip 192.168.10.30
+
+# RPi — with remote LLM and custom wake phrase
+./scripts/do_all.sh --target rpi --ip 192.168.10.30 --llm 192.168.10.10 --wwphrase "Hey Vela,Subramanya"
+```
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--target <pc\|rpi>` | Yes | Build and deploy target |
+| `--aicore <cpu\|cuda\|hailo8>` | No | AI accelerator (default: `cuda` for pc, `hailo8` for rpi) |
+| `--ip <addr>` | rpi only | RPi IP address (default: `192.168.10.30`) |
+| `--user <name>` | No | RPi login user (default: `$USER`) |
+| `-j <jobs>` | No | Parallel build jobs (default: `nproc`) |
+| `[VELAN OPTIONS]` | No | Extra args forwarded to the velan binary |
+
+---
+
 ### Step 1 — Build vhal-core
 
 vhal-core uses Conan + CMake. The script installs Conan dependencies,
@@ -226,7 +259,7 @@ by Conan automatically. No system-level dev packages or manual downloads needed.
 | Argument | Required | Values | Description |
 |----------|----------|--------|-------------|
 | `--target` | Yes | `pc`, `rpi` | Build target platform |
-| `--aicore` | No | `cuda`, `hailo8` | AI accelerator (default: CPU) |
+| `--aicore` | No | `cpu`, `cuda`, `hailo8` | AI accelerator (default: `cuda` for pc, `hailo8` for rpi) |
 | `-j` | No | number | Parallel jobs (default: `nproc`) |
 
 Output binary: `build/<target>/velan`
@@ -328,15 +361,20 @@ Extra arguments are forwarded to the Velan binary:
 # 1. Download AI models and Piper binary (on the PC)
 ./scripts/download_models.sh
 
-# 2. Build and deploy vhal-core (cross-compiled on PC, deployed to RPi)
+# 2. (Hailo-8 only, one time) Extract NPU embedding weights + vocab
+pip install openai-whisper
+python3 scripts/extract_whisper_weights.py --model tiny \
+        --out models/stt/whisper-tiny-h8l/weights
+
+# 3. Build and deploy vhal-core (cross-compiled on PC, deployed to RPi)
 ./scripts/build_vhal_core.sh  --target rpi
 ./scripts/deploy_vhal_core.sh --target rpi --ip 192.168.10.30
 
-# 3. Build and deploy Velan (cross-compiled on PC, deployed to RPi)
-./scripts/build_velan.sh  --target rpi
+# 4. Build and deploy Velan (cross-compiled on PC, deployed to RPi)
+./scripts/build_velan.sh  --target rpi --aicore hailo8
 ./scripts/deploy_velan.sh --target rpi --ip 192.168.10.30
 
-# 4. Run (vhal-core on PC, Velan on RPi via SSH)
+# 5. Run (vhal-core on PC, Velan on RPi via SSH)
 ./scripts/run_velan.sh --target rpi --ip 192.168.10.30
 ```
 
@@ -392,17 +430,46 @@ Conversation history is preserved across turns within a session.
 
 ---
 
-## Hailo AI HAT+ note
+## Hailo-8L NPU acceleration
 
-The Hailo-8L accelerator (13 TOPS) does not natively run whisper.cpp — it
-requires models compiled through the
-[Hailo Dataflow Compiler](https://hailo.ai/developer-zone/documentation/)
-into Hailo Executable Format (HEF). whisper.cpp falls back to ARM NEON SIMD
-on the RPi5 CPU, which is sufficient for interactive use with `small` or
-`medium` models.
+When `--aicore hailo8` is used, Velan runs Whisper inference on the Hailo-8L
+NPU via HailoRT instead of whisper.cpp. The pipeline is:
 
-Hailo HAT acceleration for Whisper is a separate integration step outside
-the scope of this project.
+```
+PCM audio → log-mel (CPU) → encoder.hef (NPU) → decoder.hef (NPU) → tokens → text
+```
+
+The decoder HEF uses an **input-split** architecture: the token embedding
+lookup is computed on the CPU (using `.npy` weight files) and the full
+transformer + output projection runs on the NPU. This keeps the large embedding
+table off the NPU while still offloading all attention layers.
+
+### One-time: extract NPU weights
+
+Before the first Hailo build, run the extraction script **once** on any machine
+with Python installed. It downloads the Whisper tiny model, extracts the two
+weight tensors the CPU embedding step needs, and generates the vocabulary file:
+
+```bash
+pip install openai-whisper   # also installs numpy
+python3 scripts/extract_whisper_weights.py --model tiny \
+        --out models/stt/whisper-tiny-h8l/weights
+```
+
+This creates three files (re-run only if you change the model size):
+
+| File | Size | Purpose |
+|------|------|---------|
+| `token_embedding_weight_tiny.npy` | ~75 MB | Decoder input embedding `[vocab × 384]` |
+| `onnx_add_input_tiny.npy` | ~48 KB | Positional encoding `[32 × 384]` |
+| `vocab.json` | ~1 MB | Token-ID → UTF-8 string mapping |
+
+`deploy_velan.sh` copies the whole `models/` tree to the RPi, so these files
+are automatically deployed alongside the HEF files.
+
+> **Adjust `--model` to match the HEF.** If the encoder/decoder HEFs were
+> compiled from `whisper-base`, run `--model base`; for `whisper-small`, use
+> `--model small`. Mismatched sizes cause decoder repetition loops.
 
 ---
 
@@ -479,7 +546,9 @@ velan/
 │   ├── build_velan.sh              Build Velan (Conan + CMake, pc or rpi, optional aicore)
 │   ├── deploy_velan.sh             Deploy Velan binary, Piper, models to /opt/car-ui/
 │   ├── run_velan.sh                Start vhal-core + Velan from /opt/car-ui/
-│   └── download_models.sh          Download Whisper models and Piper binary
+│   ├── do_all.sh                   build → deploy → run in one command
+│   ├── download_models.sh          Download Whisper models and Piper binary
+│   └── extract_whisper_weights.py  One-time: extract NPU embedding weights + vocab.json (Hailo)
 ├── models/
 │   ├── stt/                        Whisper model files (gitignored)
 │   └── tts/                        Piper voice model files (gitignored)

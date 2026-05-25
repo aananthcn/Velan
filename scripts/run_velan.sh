@@ -45,11 +45,15 @@ VELAN_ARGS=()
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
+LLM_HOST=""   # explicit --llm-host override; empty = auto-detect for rpi
+
 usage() {
-    echo "Usage: $(basename "$0") --target <pc|rpi> [--ip <ip>] [--user <username>] [VELAN OPTIONS]"
+    echo "Usage: $(basename "$0") --target <pc|rpi> [--ip <ip>] [--user <username>] [--llm-host <addr>] [VELAN OPTIONS]"
     echo "  --target <pc|rpi>    Run target: pc (local) or rpi (Raspberry Pi)  [required]"
     echo "  --ip <addr>          RPi IP address (default: 192.168.10.30)        [rpi only]"
     echo "  --user <username>    RPi login username (default: \$USER)            [rpi only]"
+    echo "  --llm-host <addr>    Ollama server IP/hostname visible from the RPi  [rpi only]"
+    echo "                       (default: auto-detect local IP facing the RPi)"
     echo "  [VELAN OPTIONS]      Remaining args are forwarded to the velan binary"
 }
 
@@ -66,6 +70,8 @@ while [[ $# -gt 0 ]]; do
             RPI_IP="$2"; shift 2 ;;
         --user)
             RPI_USER="$2"; shift 2 ;;
+        --llm-host)
+            LLM_HOST="$2"; shift 2 ;;
         --help)
             usage; exit 0 ;;
         *)
@@ -107,12 +113,10 @@ fi
 # ---------------------------------------------------------------------------
 VHAL_PID=
 VELAN_PID=
-SSH_PID=
 
 cleanup() {
     echo ""
     echo "[run] Shutting down..."
-    [[ -n "$SSH_PID"   ]] && kill "$SSH_PID"   2>/dev/null || true
     [[ -n "$VELAN_PID" ]] && kill "$VELAN_PID" 2>/dev/null || true
     [[ -n "$VHAL_PID"  ]] && kill "$VHAL_PID"  2>/dev/null || true
     wait 2>/dev/null || true
@@ -132,7 +136,7 @@ if [[ "$TARGET" == "pc" ]]; then
     sleep 1
 
     echo "[run] Starting velan (local)..."
-    "$VELAN" "${VELAN_ARGS[@]}" &
+    (cd "$DEPLOY_ROOT" && "$VELAN" "${VELAN_ARGS[@]}") &
     VELAN_PID=$!
 
     wait "$VELAN_PID"
@@ -159,9 +163,9 @@ if [[ "$TARGET" == "rpi" ]]; then
     sleep 1
 
     echo "[run] Starting velan on RPi (${RPI_DEST})..."
+    # Run SSH in the foreground so the terminal's Ctrl+C propagates through the
+    # PTY directly to velan on the RPi, rather than only killing the local SSH client.
     ssh -t "$RPI_DEST" \
-        "export PATH=${DEPLOY_ROOT}/bin:\$PATH; ${DEPLOY_ROOT}/bin/velan ${VELAN_ARGS[*]}" &
-    SSH_PID=$!
-
-    wait "$SSH_PID"
+        "cd ${DEPLOY_ROOT} && export PATH=${DEPLOY_ROOT}/bin:\$PATH ALSA_CONFIG_DIR=/usr/share/alsa; ./bin/velan ${VELAN_ARGS[*]}" || true
+    # EXIT trap fires here and kills vhal-core (VHAL_PID).
 fi

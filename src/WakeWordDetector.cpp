@@ -25,84 +25,54 @@
 
 #include <portaudio.h>
 
+// Whisper hallucinations on silence/noise. Filtered before phrase matching so
+// ambient sound never accidentally triggers the wake word.
+static const char* kNoisePatterns[] = {
+    "(", "[", "Thank you", "Thanks for watching", "you"
+};
+
 static constexpr int SAMPLE_RATE = 16000;
 
 // ---------------------------------------------------------------------------
-// Wake word detection — VAD-gated utterance capture
+// Wake word detection — fixed-duration capture after speech onset
 // ---------------------------------------------------------------------------
-// Audio is polled in CHUNK_MS increments.  When RMS exceeds vad_threshold_,
-// chunks are accumulated into a speech buffer.  After END_SILENCE_MS of
-// continuous silence the utterance is considered complete and handed to
-// Whisper for transcription.  This avoids running inference on silence and
-// prevents the sliding-window hallucination problem.
+// Audio is polled in CHUNK_MS increments.  When RMS exceeds eff_threshold,
+// ALL subsequent chunks are accumulated into speech_buf for LOCK_IN_MS,
+// regardless of per-chunk energy.  This avoids discarding quiet mid-word
+// phonemes (e.g. vowels in "Subramanya") that fall below the VAD threshold.
+// After LOCK_IN_MS the buffer is sent to Whisper for phrase matching.
 static constexpr int CHUNK_MS           = 100;
-static constexpr int CHUNK_FRAMES       = SAMPLE_RATE * CHUNK_MS   / 1000; // 1600
-static constexpr int END_SILENCE_MS     = 500;
-static constexpr int END_SILENCE_CHUNKS = END_SILENCE_MS / CHUNK_MS;       // 5
+static constexpr int CHUNK_FRAMES       = SAMPLE_RATE * CHUNK_MS   / 1000; // 1600 samples
 static constexpr int MIN_PHRASE_MS      = 200;
 static constexpr int MIN_PHRASE_FRAMES  = SAMPLE_RATE * MIN_PHRASE_MS / 1000; // 3200
-static constexpr int MAX_BUFFER_MS      = 5000;
-static constexpr int MAX_BUFFER_FRAMES  = SAMPLE_RATE * MAX_BUFFER_MS / 1000; // 80 000
+// Fixed capture window after onset.  Must cover the longest expected wake phrase
+// at a relaxed speaking pace.  "Subrahmanya" ≈ 700 ms; 1000 ms gives headroom.
+static constexpr int LOCK_IN_MS         = 1000;
+static constexpr int LOCK_IN_FRAMES     = SAMPLE_RATE * LOCK_IN_MS / 1000; // 16000
 
-// With GPU the thread count doesn't matter for inference; on CPU use more cores.
-static const int WWD_THREADS = std::max(4, static_cast<int>(std::thread::hardware_concurrency() / 2));
-
-
-// ---------------------------------------------------------------------------
-// Transcribe PCM audio via whisper.cpp.
-// Returns empty string on failure (treated as no match).
-// ---------------------------------------------------------------------------
-static std::string transcribe_window(whisper_context* ctx,
-                                     const std::vector<float>& pcm) {
-    whisper_full_params p = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-    p.n_threads        = WWD_THREADS;
-    p.language         = "en";
-    p.translate        = false;
-    p.print_special    = false;
-    p.print_progress   = false;
-    p.print_realtime   = false;
-    p.print_timestamps = false;
-    p.single_segment   = true;
-
-    if (whisper_full(ctx, p, pcm.data(), static_cast<int>(pcm.size())) != 0)
-        return {};
-
-    std::string out;
-    int n = whisper_full_n_segments(ctx);
-    for (int i = 0; i < n; ++i) {
-        const char* s = whisper_full_get_segment_text(ctx, i);
-        if (s) out += s;
-    }
-
-    // Whisper hallucinates stereotype phrases on silence/noise. Discard them
-    // so ambient sound never accidentally triggers a phrase match.
-    static const char* kNoise[] = {
-        "(", "[", "Thank you", "Thanks for watching", "you"
-    };
-    for (const char* pat : kNoise) {
-        if (out.find(pat) != std::string::npos) return {};
-    }
-
-    return out;
-}
+// Adaptive VAD: measure ambient RMS for this many chunks on each fresh stream open,
+// then set threshold = noise_floor * multiplier, clamped to [vad_threshold_, MAX].
+static constexpr int   WWD_NOISE_CAL_CHUNKS = 5;     // ~500 ms — short to minimise dead time
+static constexpr float WWD_NOISE_MULTIPLIER = 1.5f;  // threshold = noise_floor × 1.5
+static constexpr float WWD_THRESHOLD_MAX    = 0.10f;
 
 
 // ---------------------------------------------------------------------------
 // WakeWordDetector
 // ---------------------------------------------------------------------------
 WakeWordDetector::WakeWordDetector(TriggerCallback                  cb,
-                                   whisper_context*                 ctx,
+                                   ITranscriber*                    transcriber,
                                    const std::vector<std::string>&  wake_phrases,
                                    float                            vad_threshold,
                                    int                              mic_device)
     : callback_(std::move(cb)),
+      transcriber_(transcriber),
       vad_threshold_(vad_threshold),
       mic_device_(mic_device),
       running_(false),
-      ctx_(ctx),
       stt_active_(false) {
-    if (!ctx_)
-        throw std::runtime_error("[WakeWord] null whisper_context — STT must be initialised first");
+    if (!transcriber_)
+        throw std::runtime_error("[WakeWord] null transcriber — must be initialised first");
     if (wake_phrases.empty())
         throw std::runtime_error("[WakeWord] at least one wake phrase is required");
 
@@ -126,16 +96,15 @@ WakeWordDetector::WakeWordDetector(TriggerCallback                  cb,
     if (Pa_Initialize() != paNoError)
         throw std::runtime_error("[WakeWord] PortAudio init failed");
 
-    std::cout << "[WakeWord] Sharing Whisper context with STT.\n";
-    std::cout << "[WakeWord] Wake phrase(s):\n";
+    std::cout << log_ts() << "[WakeWord] Wake phrase(s):" << std::endl;
     for (const auto& p : wake_phrases_)
-        std::cout << "  - \"" << p << "\"\n";
+        std::cout << "  - \"" << p << "\"" << std::endl;
 }
 
 
 WakeWordDetector::~WakeWordDetector() {
     stop();
-    // ctx_ is owned by Speech2TextManager — do not free it here.
+    // transcriber_ is owned by main() — do not free it here.
     Pa_Terminate();
 }
 
@@ -150,7 +119,9 @@ void WakeWordDetector::start() {
 void WakeWordDetector::stop() {
     if (!running_.exchange(false)) return;
     cv_.notify_all();   // unblock detect_loop if it is waiting for STT
-    if (thread_.joinable()) thread_.join();
+    // Detach rather than join — whisper_full() can block for 30s+ on CPU.
+    // The OS will clean up when the process exits.
+    if (thread_.joinable()) thread_.detach();
 }
 
 
@@ -175,6 +146,14 @@ void WakeWordDetector::resume() {
 bool WakeWordDetector::phrase_matches(const std::string& text) const {
     if (text.empty()) return false;
     if (text.find("[BLANK_AUDIO]") != std::string::npos) return false;
+
+    // Reject known Whisper hallucinations before printing or matching.
+    for (const char* pat : kNoisePatterns) {
+        if (text.find(pat) != std::string::npos) {
+            std::cout << log_ts() << "[WakeWord] Heard (filtered): \"" << text << "\"\n";
+            return false;
+        }
+    }
 
     std::cout << log_ts() << "[WakeWord] Heard: \"" << text << "\"\n";
 
@@ -202,22 +181,24 @@ bool WakeWordDetector::phrase_matches(const std::string& text) const {
 
 
 // ---------------------------------------------------------------------------
-// detect_loop — VAD-gated utterance capture
+// detect_loop — onset-triggered fixed-duration capture
 //
-// Phase 1 — speech accumulation:
-//   Polls mic in CHUNK_MS increments.  Chunks above vad_threshold_ are
-//   appended to speech_buf.  After END_SILENCE_MS of trailing silence the
-//   utterance is considered complete.
+// Calibration: measure ambient RMS for WWD_NOISE_CAL_CHUNKS, use median
+// (not mean) to reject transient spikes during startup.
 //
-// Phase 2 — transcription:
-//   Only reached when a full utterance is ready (avoids inference on silence).
-//   If the transcript contains the wake phrase, hands off to Speech2TextManager.
+// Detection: wait for any chunk >= eff_threshold, then collect ALL chunks
+// for LOCK_IN_MS regardless of per-chunk energy.  No VAD-based end detection
+// inside the word — the whole window is sent to Whisper at once.
 // ---------------------------------------------------------------------------
 void WakeWordDetector::detect_loop() {
     std::vector<float> chunk(CHUNK_FRAMES);
     std::vector<float> speech_buf;
-    speech_buf.reserve(MAX_BUFFER_FRAMES);
-    int silence_chunks = 0;
+    speech_buf.reserve(LOCK_IN_FRAMES + CHUNK_FRAMES);
+    std::vector<float> cal_rms;
+    cal_rms.reserve(WWD_NOISE_CAL_CHUNKS);
+    bool  cal_done      = false;
+    float eff_threshold = vad_threshold_;
+    bool  in_speech     = false;
 
     PaStream* stream = nullptr;
 
@@ -254,9 +235,17 @@ void WakeWordDetector::detect_loop() {
             stream = nullptr;
             return false;
         }
-        std::cout << log_ts() << "[WakeWord] Microphone opened"
-                  << (info ? std::string(": ") + info->name : "")
-                  << " — listening for wake phrase.\n";
+        if (!cal_done) {
+            std::cout << log_ts() << "[WakeWord] Microphone opened"
+                      << (info ? std::string(": ") + info->name : "")
+                      << " — calibrating VAD...\n";
+            cal_rms.clear();
+        } else {
+            std::cout << log_ts() << "[WakeWord] Microphone opened"
+                      << (info ? std::string(": ") + info->name : "")
+                      << " — VAD threshold: " << eff_threshold
+                      << " (reusing calibration).\n";
+        }
         return true;
     };
 
@@ -274,11 +263,14 @@ void WakeWordDetector::detect_loop() {
             { std::lock_guard<std::mutex> lk(mutex_); active = stt_active_; }
             if (active) {
                 close_stream();
+                in_speech = false;
                 speech_buf.clear();
-                silence_chunks = 0;
                 std::unique_lock<std::mutex> lk(mutex_);
                 cv_.wait(lk, [this] { return !stt_active_ || !running_.load(); });
                 std::cout << log_ts() << "[WakeWord] STT done — resuming detection.\n";
+                // TTS may have altered ambient level — recalibrate.
+                cal_done = false;
+                cal_rms.clear();
                 continue;
             }
         }
@@ -289,49 +281,95 @@ void WakeWordDetector::detect_loop() {
         }
 
         if (Pa_ReadStream(stream, chunk.data(), CHUNK_FRAMES) != paNoError) {
+            std::cerr << log_ts() << "[WakeWord] Pa_ReadStream error — reopening stream.\n";
             close_stream();
+            in_speech = false;
+            speech_buf.clear();
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
         }
 
         float energy = 0.0f;
         for (float s : chunk) energy += s * s;
-        const bool is_speech = std::sqrt(energy / CHUNK_FRAMES) >= vad_threshold_;
+        float rms = std::sqrt(energy / CHUNK_FRAMES);
 
-        if (is_speech) {
-            speech_buf.insert(speech_buf.end(), chunk.begin(), chunk.end());
-            silence_chunks = 0;
-        } else if (!speech_buf.empty()) {
-            // Trailing silence — keep accumulating until END_SILENCE_CHUNKS
-            speech_buf.insert(speech_buf.end(), chunk.begin(), chunk.end());
-            ++silence_chunks;
+        // Calibration: collect WWD_NOISE_CAL_CHUNKS samples, then use their median
+        // as the noise floor.  Median rejects transient spikes (keyboard, AC startup)
+        // that inflate a mean-based estimate and drive eff_threshold too high.
+        if (!cal_done) {
+            cal_rms.push_back(rms);
+            std::cout << log_ts() << "[WakeWord] CAL " << cal_rms.size()
+                      << "/" << WWD_NOISE_CAL_CHUNKS << "  RMS=" << rms << "\n";
+            if ((int)cal_rms.size() >= WWD_NOISE_CAL_CHUNKS) {
+                std::vector<float> sorted = cal_rms;
+                std::sort(sorted.begin(), sorted.end());
+                float noise_floor = sorted[sorted.size() / 2];  // median
+                eff_threshold = std::min(WWD_THRESHOLD_MAX,
+                                std::max(vad_threshold_, noise_floor * WWD_NOISE_MULTIPLIER));
+                std::cout << log_ts() << "[WakeWord] Noise floor (median): " << noise_floor
+                          << "  VAD threshold: " << eff_threshold
+                          << " — listening for wake phrase.\n";
+                cal_done = true;
+            }
+            continue;
         }
 
-        // Decide whether to transcribe: utterance ended or buffer safety cap hit
-        const bool utterance_ended = !speech_buf.empty() &&
-                                     silence_chunks >= END_SILENCE_CHUNKS;
-        const bool buffer_capped   = (int)speech_buf.size() >= MAX_BUFFER_FRAMES;
+        if (!in_speech) {
+            if (rms >= eff_threshold) {
+                std::cout << log_ts() << "[WakeWord] Onset  RMS=" << rms
+                          << " thresh=" << eff_threshold
+                          << " — capturing " << LOCK_IN_MS << " ms...\n";
+                in_speech = true;
+                speech_buf.clear();
+                speech_buf.insert(speech_buf.end(), chunk.begin(), chunk.end());
+            }
+        } else {
+            // Fixed-duration capture: accumulate ALL chunks regardless of energy.
+            // Quiet mid-word phonemes stay in the buffer; Whisper handles them.
+            speech_buf.insert(speech_buf.end(), chunk.begin(), chunk.end());
+            int buf_ms = static_cast<int>(speech_buf.size() * 1000 / SAMPLE_RATE);
+            std::cout << log_ts() << "[WakeWord] Capture "
+                      << buf_ms << "/" << LOCK_IN_MS << " ms  RMS=" << rms << "\n";
 
-        if (utterance_ended || buffer_capped) {
-            if ((int)speech_buf.size() >= MIN_PHRASE_FRAMES) {
-                std::string text = transcribe_window(ctx_, speech_buf);
+            if ((int)speech_buf.size() >= LOCK_IN_FRAMES) {
+                in_speech = false;
+                // Close mic before inference — Whisper can block for seconds on CPU.
+                close_stream();
+                std::cout << log_ts() << "[WakeWord] Transcribing " << buf_ms
+                          << " ms (Whisper)...\n";
+                auto t0 = std::chrono::steady_clock::now();
+                std::string text = transcriber_->transcribe(speech_buf,
+                                                             /*single_segment=*/true,
+                                                             /*audio_ctx=*/128);
+                auto inf_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now() - t0).count();
+                std::cout << log_ts() << "[WakeWord] Whisper done in " << inf_ms << " ms.\n";
+
                 if (phrase_matches(text)) {
-                    close_stream();
                     std::cout << log_ts() << "[WakeWord] Phrase matched — handing off to STT.\n";
                     {
                         std::lock_guard<std::mutex> lk(mutex_);
                         stt_active_ = true;
                     }
                     callback_();
-                    // LISTENING → PROCESSING: block until STT pipeline finishes
+                    // Block until STT pipeline finishes (PROCESSING → LISTENING).
                     {
                         std::unique_lock<std::mutex> lk(mutex_);
                         cv_.wait(lk, [this] { return !stt_active_ || !running_.load(); });
                     }
                     std::cout << log_ts() << "[WakeWord] STT done — resuming detection.\n";
+                    cal_done = false;
+                    cal_rms.clear();
+                } else {
+                    // Cooldown: give the user a clear window to speak before listening
+                    // again. Without this, GPU inference completes in ~100 ms and the
+                    // next false trigger fires immediately, blocking the user's voice.
+                    std::cout << log_ts() << "[WakeWord] No match — cooldown 1 s.\n";
+                    for (int i = 0; i < 10 && running_.load(); ++i)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
+                speech_buf.clear();
             }
-            speech_buf.clear();
-            silence_chunks = 0;
         }
     }
 

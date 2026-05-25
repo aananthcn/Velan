@@ -15,26 +15,28 @@
 #include "Speech2TextManager.h"
 #include "log.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
+#include <vector>
 
 #include <portaudio.h>
 
 static const int   SAMPLE_RATE        = 16000;
 static const int   CHUNK_FRAMES       = 1024;
-static const int   WHISPER_THREADS    = 4;
 
 // VAD parameters for end-of-speech detection inside record_audio().
-static constexpr float VAD_RMS_THRESHOLD        = 0.02f;  // minimum threshold floor
-static constexpr float VAD_NOISE_MULTIPLIER     = 3.0f;   // speech must be 3× the ambient noise floor
+static constexpr float VAD_RMS_THRESHOLD        = 0.01f;  // minimum threshold floor (matches WWD)
+static constexpr float VAD_NOISE_MULTIPLIER     = 2.0f;   // threshold = noise_floor × 2; lower than
+                                                           // the old 3× which sat above normal speech
 static constexpr float VAD_THRESHOLD_MAX        = 0.10f;  // cap: prevents noisy rooms from setting
                                                            // threshold above normal speech levels
 static constexpr int   VAD_NOISE_CAL_CHUNKS     = 5;      // calibrate noise floor over first ~320 ms
 static constexpr int   VAD_SILENCE_CHUNKS       = 20;     // ~1.3 s of silence ends recording
 static constexpr int   VAD_MIN_SPEECH_CHUNKS    = 5;      // must see ~320 ms of speech first
-static constexpr int   VAD_NO_SPEECH_TIMEOUT    = 125;    // abort after ~8 s if speech never starts
+static constexpr int   VAD_NO_SPEECH_TIMEOUT    = 50;     // abort after ~3.2 s if speech never starts
 static constexpr int   VAD_MAX_RECORD_FRAMES    = SAMPLE_RATE * 30; // hard cap: 30 s
 
 extern volatile bool g_interrupted;
@@ -86,10 +88,10 @@ static std::vector<float> record_audio(std::atomic<bool>& stop_flag, int mic_dev
     bool  speech_started = false;
 
     // Calibrate adaptive threshold: measure ambient RMS over the first
-    // VAD_NOISE_CAL_CHUNKS chunks, then set threshold = noise_floor * multiplier.
-    // This handles noisy environments where a fixed threshold fails.
-    float noise_floor    = 0.0f;
-    int   cal_chunks     = 0;
+    // VAD_NOISE_CAL_CHUNKS chunks, then set threshold = median * multiplier.
+    // Median (not mean) rejects transient spikes at stream open time.
+    std::vector<float> cal_rms;
+    cal_rms.reserve(VAD_NOISE_CAL_CHUNKS);
     float vad_threshold  = VAD_RMS_THRESHOLD;
 
     while (!g_interrupted && !stop_flag.load()) {
@@ -105,14 +107,15 @@ static std::vector<float> record_audio(std::atomic<bool>& stop_flag, int mic_dev
         for (float s : buf) energy += s * s;
         float rms = std::sqrt(energy / CHUNK_FRAMES);
 
-        if (cal_chunks < VAD_NOISE_CAL_CHUNKS) {
-            noise_floor += rms;
-            ++cal_chunks;
-            if (cal_chunks == VAD_NOISE_CAL_CHUNKS) {
-                noise_floor  /= VAD_NOISE_CAL_CHUNKS;
+        if ((int)cal_rms.size() < VAD_NOISE_CAL_CHUNKS) {
+            cal_rms.push_back(rms);
+            if ((int)cal_rms.size() == VAD_NOISE_CAL_CHUNKS) {
+                std::vector<float> sorted = cal_rms;
+                std::sort(sorted.begin(), sorted.end());
+                float noise_floor = sorted[sorted.size() / 2];  // median
                 vad_threshold = std::min(VAD_THRESHOLD_MAX,
                                 std::max(VAD_RMS_THRESHOLD, noise_floor * VAD_NOISE_MULTIPLIER));
-                std::cout << log_ts() << "[Velan] Noise floor: " << noise_floor
+                std::cout << log_ts() << "[Velan] Noise floor (median): " << noise_floor
                           << "  VAD threshold: " << vad_threshold << "\n";
             }
             continue;  // don't count calibration chunks as speech
@@ -145,82 +148,37 @@ static std::vector<float> record_audio(std::atomic<bool>& stop_flag, int mic_dev
 }
 
 
-// ---------------------------------------------------------------------------
-// Whisper transcription
-// ---------------------------------------------------------------------------
-static std::string transcribe(whisper_context* ctx, const std::vector<float>& pcm) {
-    if (pcm.empty()) return {};
-
-    whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-    params.n_threads           = WHISPER_THREADS;
-    params.language            = "en";
-    params.translate           = false;
-    params.print_special       = false;
-    params.print_progress      = false;
-    params.print_realtime      = false;
-    params.print_timestamps    = false;
-    params.single_segment      = false;
-
-    if (whisper_full(ctx, params, pcm.data(), static_cast<int>(pcm.size())) != 0)
-        throw std::runtime_error("whisper_full() failed");
-
-    std::string text;
-    int n = whisper_full_n_segments(ctx);
-    for (int i = 0; i < n; ++i) {
-        const char* seg = whisper_full_get_segment_text(ctx, i);
-        if (seg) text += seg;
-    }
-    return text;
-}
 
 
 // ---------------------------------------------------------------------------
 // Speech2TextManager
 // ---------------------------------------------------------------------------
-Speech2TextManager& Speech2TextManager::instance(const char* stt_model_path,
+Speech2TextManager& Speech2TextManager::instance(ITranscriber* transcriber,
                                                   std::function<void()> on_start,
                                                   std::function<void(const std::string&)> on_transcript,
                                                   int mic_device) {
-    static Speech2TextManager inst(stt_model_path,
+    static Speech2TextManager inst(transcriber,
                                    std::move(on_start), std::move(on_transcript),
                                    mic_device);
     return inst;
 }
 
-Speech2TextManager::Speech2TextManager(const char* stt_model_path,
+Speech2TextManager::Speech2TextManager(ITranscriber* transcriber,
                                         std::function<void()> on_start,
                                         std::function<void(const std::string&)> on_transcript,
                                         int mic_device)
-    : ctx_(nullptr),
+    : transcriber_(transcriber),
       on_start_(std::move(on_start)), on_transcript_(std::move(on_transcript)),
       mic_device_(mic_device), is_recording_(false), stop_recording_(false) {
+    if (!transcriber_)
+        throw std::runtime_error("[STT] null transcriber passed to Speech2TextManager");
     if (Pa_Initialize() != paNoError)
         throw std::runtime_error("PortAudio init failed");
-
-    wparams_ = whisper_context_default_params();
-#ifdef GGML_USE_CUDA
-    wparams_.use_gpu    = true;
-    wparams_.gpu_device = 0;
-    std::cout << "[Velan] Loading Whisper model (GPU): " << stt_model_path << "\n";
-#else
-    wparams_.use_gpu    = false;
-    std::cout << "[Velan] Loading Whisper model (CPU): " << stt_model_path << "\n";
-#endif
-    ctx_ = whisper_init_from_file_with_params(stt_model_path, wparams_);
-    if (!ctx_) {
-        Pa_Terminate();
-        throw std::runtime_error(
-            std::string("Failed to load Whisper model from: ") + stt_model_path + "\n"
-            "Run:  ./scripts/download_models.sh");
-    }
-
-    std::cout << "[Velan] Whisper model loaded.\n";
 }
 
 Speech2TextManager::~Speech2TextManager() {
     stop_recording_ = true;
     if (rec_thread_.joinable()) rec_thread_.join();
-    whisper_free(ctx_);
     Pa_Terminate();
 }
 
@@ -257,7 +215,9 @@ std::string Speech2TextManager::process() {
     std::cout << log_ts() << "[Velan] Transcribing...\n";
     std::string transcript;
     try {
-        transcript = transcribe(ctx_, audio_);
+        // STT uses multi-segment mode (single_segment=false) so longer utterances
+        // are naturally split into sentences. No audio_ctx limit — full fidelity.
+        transcript = transcriber_->transcribe(audio_, /*single_segment=*/false, /*audio_ctx=*/0);
     } catch (const std::exception& e) {
         std::cerr << log_ts() << "[Velan] Transcription error: " << e.what() << "\n";
         return {};

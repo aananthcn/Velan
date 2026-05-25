@@ -67,7 +67,41 @@ if(GGML_CUDA)
     endif()
     message(STATUS "CUDA ${CUDAToolkit_VERSION} enabled — architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 elseif(GGML_HAILO8)
-    message(STATUS "Hailo-8 NPU inference enabled (SDK must be installed manually on target)")
+    # libhailort is installed on the RPi via apt (not Conan).
+    # It lives under usr/lib (not aarch64-linux-gnu/).
+    # CMAKE_CROSSCOMPILING is FALSE for Linux→Linux cross-builds, so we
+    # search both the synced PC sysroot and the native /usr/lib in order.
+    # Always clear any cached NOTFOUND result so a freshly synced sysroot
+    # is picked up on the next configure without deleting the build tree.
+    unset(HAILORT_LIB CACHE)
+    find_library(HAILORT_LIB hailort
+        PATHS
+            "$ENV{HOME}/sdk/rpi/adas/usr/lib"   # cross-build: synced sysroot
+            "/usr/lib"                           # native build on the RPi
+        NO_DEFAULT_PATH
+    )
+    if(NOT HAILORT_LIB)
+        message(FATAL_ERROR
+            "libhailort not found in sysroot or /usr/lib.\n"
+            "Cross-build: run ./scripts/sync_rpi_sysroot.sh first.\n"
+            "Native build: sudo apt install hailort")
+    endif()
+    message(STATUS "HailoRT: ${HAILORT_LIB}")
+
+    # Derive the include dir from where the library was found:
+    #   .../usr/lib/libhailort.so  →  .../usr/include
+    get_filename_component(_hailo_lib_dir "${HAILORT_LIB}" DIRECTORY)
+    get_filename_component(_hailo_usr     "${_hailo_lib_dir}" DIRECTORY)
+
+    add_library(hailort SHARED IMPORTED)
+    # Add both the generic include dir and the multiarch dir so the
+    # cross-compiler can resolve <bits/wchar2-decl.h> and similar headers
+    # that live under include/aarch64-linux-gnu/ in the synced sysroot.
+    set_target_properties(hailort PROPERTIES
+        IMPORTED_LOCATION             "${HAILORT_LIB}"
+        INTERFACE_INCLUDE_DIRECTORIES
+            "${_hailo_usr}/include;${_hailo_usr}/include/aarch64-linux-gnu"
+    )
 else()
     message(STATUS "CPU inference")
 endif()
@@ -199,13 +233,20 @@ target_link_libraries(velan_proto PUBLIC
 # ---------------------------------------------------------------------------
 # Target
 # ---------------------------------------------------------------------------
-add_executable(velan
+set(VELAN_SOURCES
     src/main.cpp
+    src/WhisperTranscriber.cpp
     src/Speech2TextManager.cpp
     src/TransformerManager.cpp
     src/Text2SpeechManager.cpp
     src/WakeWordDetector.cpp
 )
+
+if(GGML_HAILO8)
+    list(APPEND VELAN_SOURCES src/HailoTranscriber.cpp)
+endif()
+
+add_executable(velan ${VELAN_SOURCES})
 
 target_link_libraries(velan PRIVATE
     whisper::whisper
@@ -221,6 +262,9 @@ if(GGML_CUDA)
     # so -lcudart/-lcublas/-lcublasLt/-lcuda (injected by the whisper Conan
     # package as system_libs) would fail without this -L.
     target_link_directories(velan PRIVATE ${CUDAToolkit_LIBRARY_DIR})
+elseif(GGML_HAILO8)
+    target_link_libraries(velan PRIVATE hailort)
+    target_compile_definitions(velan PRIVATE GGML_USE_HAILO8)
 endif()
 
 # ---------------------------------------------------------------------------

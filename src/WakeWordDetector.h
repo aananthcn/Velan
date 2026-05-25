@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include "Transcriber.h"
+
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -22,9 +24,7 @@
 #include <thread>
 #include <vector>
 
-#include <whisper.h>
-
-#define WWD_DEFAULT_WAKE_WORDS "Hey Vela, Subramanya, Subramani, Subrahmanya, Supramani"
+#define WWD_DEFAULT_WAKE_WORDS "Hey Vela, Subramanya, Subramani, Subrahmanya, Supramani, Brahmani, Subraman"
 
 // Continuously listens on the microphone in LISTENING state.
 // When the wake phrase is detected, fires callback() and blocks until
@@ -32,17 +32,17 @@
 // The two states (LISTENING / PROCESSING) are mutually exclusive: only
 // one component owns the microphone at a time.
 //
-// Shares the whisper_context* owned by Speech2TextManager — no second model
-// is loaded. Safe because LISTENING and PROCESSING never overlap.
+// Shares the ITranscriber* owned by main() — no second model is loaded.
+// Safe because LISTENING and PROCESSING never overlap.
 class WakeWordDetector {
 public:
     using TriggerCallback = std::function<void()>;
 
     // wake_phrases: one or more phrases; any match fires the trigger.
-    // mic_device: PortAudio device index, or -1 to use the system default.
-    //             Pass the index from --mic or from list_input_devices() in main.
+    // transcriber: shared transcription backend (WhisperTranscriber or HailoTranscriber).
+    // mic_device:  PortAudio device index, or -1 to use the system default.
     WakeWordDetector(TriggerCallback                  cb,
-                     whisper_context*                 ctx,
+                     ITranscriber*                    transcriber,
                      const std::vector<std::string>&  wake_phrases,
                      float                            vad_threshold = 0.01f,
                      int                              mic_device    = -1);
@@ -60,15 +60,15 @@ private:
     void detect_loop();
     bool phrase_matches(const std::string& text) const;
 
-    TriggerCallback         callback_;
-    std::vector<std::string> wake_phrases_; // each stored lower-case, punctuation-free
-    float                   vad_threshold_;
-    int                     mic_device_;    // PortAudio device index; -1 = default
-    std::atomic<bool>       running_;
-    std::thread             thread_;
-    whisper_context*        ctx_;
+    TriggerCallback          callback_;
+    ITranscriber*            transcriber_;   // non-owning; owned by main()
+    std::vector<std::string> wake_phrases_;  // each stored lower-case, punctuation-free
+    float                    vad_threshold_;
+    int                      mic_device_;    // PortAudio device index; -1 = default
+    std::atomic<bool>        running_;
+    std::thread              thread_;
 
-    std::mutex              mutex_;
-    std::condition_variable cv_;
-    bool                    stt_active_;
+    std::mutex               mutex_;
+    std::condition_variable  cv_;
+    bool                     stt_active_;
 };

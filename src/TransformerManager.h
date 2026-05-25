@@ -20,11 +20,15 @@
 
 class TransformerManager {
 public:
-    explicit TransformerManager(const std::string& model);
+    // host: Ollama server hostname or IP (default "localhost").
+    // Allows the LLM to run on a remote machine, e.g. a PC while STT/TTS run on RPi.
+    explicit TransformerManager(const std::string& model,
+                                const std::string& host = "localhost");
 
     std::string chat(const std::string& user_text);
 
 private:
     std::string    model_;
+    std::string    chat_url_;
     nlohmann::json history_;
 };

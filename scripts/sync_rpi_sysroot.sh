@@ -65,6 +65,7 @@ echo "[sdk] SSH OK."
 # ---------------------------------------------------------------------------
 DEV_PKGS=(
     portaudio19-dev
+    libasound2-dev      # ALSA — required by portaudio cross-build (PA_USE_ALSA)
     libcurl4-openssl-dev
     libgrpc++-dev
     libprotobuf-dev
@@ -95,6 +96,27 @@ rsync_from_rpi() {
 
 rsync_from_rpi "/usr"
 rsync_from_rpi "/lib"
+
+# ---------------------------------------------------------------------------
+# Fix absolute symlinks — rsync preserves them as-is, but on the PC they
+# point to paths that don't exist (e.g. /usr/lib/libhailort.so →
+# /usr/lib/libhailort.so.4.23.0 resolves fine on RPi but is broken here).
+# Rewrite any absolute symlink whose target lands inside the sysroot to a
+# relative symlink so the cross-compiler and CMake can follow it.
+# ---------------------------------------------------------------------------
+echo "[sdk] Fixing absolute symlinks in sysroot..."
+find "${SYSROOT_DIR}" -type l | while read -r link; do
+    target=$(readlink "$link")
+    # Skip relative symlinks — they're already correct
+    [[ "$target" == /* ]] || continue
+    # Absolute path: check if the target exists inside the sysroot
+    sysroot_target="${SYSROOT_DIR}${target}"
+    [[ -e "$sysroot_target" ]] || continue
+    # Rewrite to a relative symlink
+    rel=$(realpath --relative-to="$(dirname "$link")" "$sysroot_target")
+    ln -sfn "$rel" "$link"
+done
+echo "[sdk] Symlinks fixed."
 
 echo ""
 echo "[sdk] Sysroot sync complete: ${SYSROOT_DIR}"

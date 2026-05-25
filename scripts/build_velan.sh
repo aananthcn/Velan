@@ -109,9 +109,45 @@ echo "[build] Target=${TARGET}, AI core=${AICORE}, CUDA=${GGML_CUDA}, Hailo8=${G
 echo "[build] Build directory: build/${TARGET}"
 
 # ---------------------------------------------------------------------------
-# whisper.cpp local Conan recipe — create once, Conan caches the result.
+# Wipe stale CMake cache when switching between pc and rpi targets.
+# Must happen BEFORE conan install so we don't delete the freshly-generated
+# conan_toolchain.cmake. Conan's toolchain sets CMAKE_CXX_COMPILER; the
+# aarch64 string check works for both old and Conan-generated toolchains.
+# ---------------------------------------------------------------------------
+if [[ -f "$BUILD_DIR/CMakeCache.txt" ]]; then
+    cached_cxx=$(grep -s "^CMAKE_CXX_COMPILER:" "$BUILD_DIR/CMakeCache.txt" \
+                 | cut -d= -f2 || true)
+    case "$TARGET" in
+        pc)
+            if [[ "$cached_cxx" == *"aarch64"* ]]; then
+                echo "[build] Stale cache (was rpi) — wiping build/${TARGET}..."
+                rm -rf "$BUILD_DIR"
+            fi
+            ;;
+        rpi)
+            if [[ -z "$cached_cxx" || "$cached_cxx" != *"aarch64"* ]]; then
+                echo "[build] Stale cache (was pc) — wiping build/${TARGET}..."
+                rm -rf "$BUILD_DIR"
+            fi
+            ;;
+    esac
+fi
+
+# ---------------------------------------------------------------------------
+# Local Conan recipes — create once, Conan caches the result.
 # Re-runs are fast (no-op if package already in ~/.conan2 cache).
 # ---------------------------------------------------------------------------
+
+# portaudio: upstream recipe auto-detects JACK from the build host and compiles
+# pa_jack.c, but never declares libjack in system_libs — causing linker failures
+# when cross-compiling for aarch64.  Our local recipe adds PA_USE_JACK=OFF.
+echo "[build] Conan: creating portaudio package (cached after first run)..."
+conan create "$ROOT_DIR/conan/recipes/portaudio" \
+    --version 19.7 \
+    --profile:host="$PROF_HOST" \
+    --profile:build="$PROF_BUILD" \
+    --build=missing
+
 echo "[build] Conan: creating whisper.cpp package (cached after first run)..."
 conan create "$ROOT_DIR/conan/recipes/whisper" \
     --version 1.7.4 \
@@ -137,30 +173,6 @@ conan install "$ROOT_DIR" \
 # (from the Conan package cache) are on PATH when cmake runs find_program.
 # shellcheck source=/dev/null
 source "$BUILD_DIR/conanbuild.sh"
-
-# ---------------------------------------------------------------------------
-# Wipe stale CMake cache when switching between pc and rpi targets.
-# Conan's toolchain sets CMAKE_CXX_COMPILER; the aarch64 string check
-# works for both the old toolchain and Conan-generated toolchain.
-# ---------------------------------------------------------------------------
-if [[ -f "$BUILD_DIR/CMakeCache.txt" ]]; then
-    cached_cxx=$(grep -s "^CMAKE_CXX_COMPILER:" "$BUILD_DIR/CMakeCache.txt" \
-                 | cut -d= -f2 || true)
-    case "$TARGET" in
-        pc)
-            if [[ "$cached_cxx" == *"aarch64"* ]]; then
-                echo "[build] Stale cache (was rpi) — wiping build/${TARGET}..."
-                rm -rf "$BUILD_DIR"
-            fi
-            ;;
-        rpi)
-            if [[ -z "$cached_cxx" || "$cached_cxx" != *"aarch64"* ]]; then
-                echo "[build] Stale cache (was pc) — wiping build/${TARGET}..."
-                rm -rf "$BUILD_DIR"
-            fi
-            ;;
-    esac
-fi
 
 # ---------------------------------------------------------------------------
 # Configure and build
