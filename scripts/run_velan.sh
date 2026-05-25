@@ -162,6 +162,23 @@ if [[ "$TARGET" == "rpi" ]]; then
 
     sleep 1
 
+    # --- Inject --llm <host_ip> so velan on the RPi can reach Ollama on this PC ---
+    # Only add it if the caller hasn't already passed --llm in VELAN_ARGS.
+    if ! printf '%s\n' "${VELAN_ARGS[@]}" | grep -q '^--llm$'; then
+        if [[ -z "$LLM_HOST" ]]; then
+            # Auto-detect: which local IP does the kernel route toward the RPi?
+            LLM_HOST=$(ip route get "${RPI_IP}" 2>/dev/null \
+                       | grep -oP 'src \K[\d.]+' | head -1)
+        fi
+        if [[ -n "$LLM_HOST" ]]; then
+            echo "[run] Ollama host (for RPi): ${LLM_HOST}  (override with --llm-host <addr>)"
+            VELAN_ARGS+=("--llm" "${LLM_HOST}")
+        else
+            echo "[run] WARNING: could not detect local IP — velan will try Ollama at localhost."
+            echo "[run]          Pass --llm-host <your_pc_ip> if Ollama isn't on the RPi."
+        fi
+    fi
+
     echo "[run] Starting velan on RPi (${RPI_DEST})..."
     # Run SSH in the foreground so the terminal's Ctrl+C propagates through the
     # PTY directly to velan on the RPi, rather than only killing the local SSH client.
