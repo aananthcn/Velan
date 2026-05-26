@@ -89,6 +89,7 @@ struct VelanConfigs {
     std::string decoder_hef     = DEFAULT_DECODER_HEF;
     std::string vocab_json      = DEFAULT_VOCAB_JSON;
     int         mic_device      = -1;   // -1 = PortAudio system default; override with --mic
+    std::string tts_sink        = "";   // ALSA device for aplay fallback (e.g. "plughw:0,0")
     std::string test_wav        = "";   // if non-empty: transcribe this WAV file and exit
 };
 
@@ -127,6 +128,7 @@ static void print_help(const char* prog) {
         << "  --vocab-json  <path>    Whisper vocab JSON for detokenisation (hailo8 only)\n"
         << "  --mic         <index>   PortAudio input device index\n"
         << "  --list-mic              Print available microphone devices and exit\n"
+        << "  --tts-sink    <device>  ALSA device for TTS aplay fallback (e.g. plughw:0,0)\n"
         << "  --test-wav  <path>      Transcribe a WAV file (16 kHz mono PCM) and exit\n"
         << "  --help                  Show this help\n\n"
         << "Defaults:\n"
@@ -220,6 +222,13 @@ static bool parse_cmdline(int argc, char* argv[], VelanConfigs& cfg) {
                 return false;
             }
             cfg.mic_device = std::stoi(argv[++i]);
+        }
+        else if (std::strcmp(argv[i], "--tts-sink") == 0) {
+            if ((i + 1) >= argc) {
+                std::cerr << "[Velan] Missing value for --tts-sink\n";
+                return false;
+            }
+            cfg.tts_sink = argv[++i];
         }
         else if (std::strcmp(argv[i], "--test-wav") == 0) {
             if ((i + 1) >= argc) {
@@ -422,6 +431,10 @@ int main(int argc, char* argv[]) {
         std::cout << log_ts() << "[Velan] Mic device     : system default\n";
     else
         std::cout << log_ts() << "[Velan] Mic device     : " << cfg.mic_device << "\n";
+    if (cfg.tts_sink.empty())
+        std::cout << log_ts() << "[Velan] TTS ALSA sink  : system default\n";
+    else
+        std::cout << log_ts() << "[Velan] TTS ALSA sink  : " << cfg.tts_sink << "\n";
     std::cout << log_ts() << "[Velan] =====================================\n";
 
     // ---- Transcriber: one model instance shared by STT and WWD ----
@@ -470,7 +483,7 @@ int main(int argc, char* argv[]) {
 
     // ---- Normal runtime: init TTS, LLM, STT manager, WWD, VHAL loop ----
     g_llm = std::make_unique<TransformerManager>(cfg.ollama_model, cfg.ollama_host);
-    g_tts = std::make_unique<Text2SpeechManager>(cfg.tts_model);
+    g_tts = std::make_unique<Text2SpeechManager>(cfg.tts_model, cfg.tts_sink);
 
     // ---- STT: uses the shared transcriber ----
     Speech2TextManager* mgr_ptr;

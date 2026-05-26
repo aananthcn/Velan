@@ -18,9 +18,14 @@
 
 class Text2SpeechManager {
 public:
-    explicit Text2SpeechManager(const std::string& model_path);
+    // model_path  : path to the Piper .onnx voice model.
+    // alsa_sink   : ALSA device passed to aplay via -D (e.g. "plughw:0,0").
+    //               Empty string = let aplay use its own default.
+    explicit Text2SpeechManager(const std::string& model_path,
+                                const std::string& alsa_sink = "");
     void speak(const std::string& text);
 
 private:
     std::string model_;
+    std::string alsa_sink_;   // passed to aplay -D when PortAudio is unavailable
 };

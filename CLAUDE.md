@@ -305,6 +305,29 @@ each shaped `FCR(1×32×vpc)` where vpc≈12966 (vocab split).  `decoder_step()`
 all 4 into one contiguous logits vector `[vocab_size]` and takes argmax for greedy
 decoding.  The vocab size must match `token_embedding_weight_tiny.npy` row count.
 
+### Ollama — network binding for RPi deployment
+
+When velan runs on the RPi but Ollama runs on the host PC, the default
+`--llm localhost` will fail with `curl: Couldn't connect to server`.
+
+**`run_velan.sh` auto-fixes this**: for `--target rpi` it detects the host
+IP that routes toward the RPi (`ip route get <RPI_IP>`) and injects
+`--llm <host_ip>` automatically.  Override with `--llm-host <addr>` if the
+auto-detect is wrong.
+
+**Ollama must also be listening on all interfaces** on the host PC (by
+default it binds to `127.0.0.1` only):
+```bash
+# One-shot:
+ollama stop 2>/dev/null; OLLAMA_HOST=0.0.0.0 ollama serve
+
+# Permanent (systemd):
+sudo systemctl edit ollama
+# Add:  [Service]
+#       Environment="OLLAMA_HOST=0.0.0.0"
+sudo systemctl restart ollama
+```
+
 ---
 
 ## What NOT to do

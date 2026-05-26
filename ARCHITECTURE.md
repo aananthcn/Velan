@@ -31,7 +31,7 @@ vendor-defined trigger property. It does not expose any server port of its own.
                                        │
              ┌─────────────────────────┴──────────────────────┐
              │  VHAL gRPC trigger                              │  Wake word
-             │  prop == 0x21400001                             │  (whisper.cpp)
+             │  prop == 0x21400001                             │  (ITranscriber)
              │                                                 │
              │  TRIGGER_ON  (1) ──────────────────────────────►│
              │  TRIGGER_OFF (0) ── ignored (VAD stops STT)     │
@@ -47,7 +47,7 @@ vendor-defined trigger property. It does not expose any server port of its own.
                                 │
                                 ▼
                   record_audio()   ← VAD self-terminates
-                  transcribe()     ← whisper.cpp
+                  transcribe()     ← ITranscriber (whisper.cpp or Hailo-8L NPU)
                   chat()           ← Ollama REST API
                   speak()          ← Piper TTS → PortAudio
                                 │
@@ -117,20 +117,50 @@ FakeVehicleHardware pushes updates from a different thread.
 
 ---
 
-## Shared Whisper Context
+## Transcriber Abstraction (`ITranscriber`)
 
-`WakeWordDetector` and `Speech2TextManager` share a single `whisper_context*`
-loaded by `Speech2TextManager` at startup.
+All speech-to-text inference goes through the `ITranscriber` interface
+(`src/Transcriber.h`):
 
-The tiny model (`ggml-tiny.bin`) was too inaccurate for "Subramani" — it
-hallucinated "Hey Bella", "Hey where are you?" etc. The medium model
-(`ggml-medium.bin`) is used for both STT and wake-word detection.
+```cpp
+class ITranscriber {
+public:
+    virtual std::string transcribe(const std::vector<float>& pcm,
+                                   bool single_segment) = 0;
+    virtual ~ITranscriber() = default;
+};
+```
 
-Sharing is safe because LISTENING and PROCESSING are mutually exclusive — the
-context is never accessed concurrently. Memory cost: one model (~1.5 GB) instead
-of two (~1.6 GB for tiny + medium).
+Two concrete implementations:
 
-`--sttmodel` controls the model path for both STT and WWD.
+| Class | File | Backend | When used |
+|-------|------|---------|-----------|
+| `WhisperTranscriber` | `src/WhisperTranscriber.cpp` | whisper.cpp (CPU/CUDA) | `--aicore whisper` (default on PC) |
+| `HailoTranscriber` | `src/HailoTranscriber.cpp` | HailoRT NPU (Hailo-8L) | `--aicore hailo8` (default on RPi) |
+
+`g_transcriber` is a `unique_ptr<ITranscriber>` created in `main()` before any
+other component. Both `WakeWordDetector` and `Speech2TextManager` receive a raw
+`ITranscriber*` pointer to the same instance.
+
+---
+
+## Shared Transcriber Context
+
+`WakeWordDetector` and `Speech2TextManager` share a **single transcriber
+instance** created in `main()`.
+
+**Why sharing is safe:** LISTENING and PROCESSING are mutually exclusive — the
+transcriber is never accessed concurrently.
+
+**WhisperTranscriber path:** the tiny model (`ggml-tiny.bin`) was too inaccurate
+for "Subramani" — hallucinated "Hey Bella", "Hey where are you?" etc. The medium
+model (`ggml-medium.bin`) is used for both STT and WWD. `--sttmodel` controls
+the path for both.
+
+**HailoTranscriber path:** the NPU HEF files are fixed at compile/deploy time
+(`encoder.hef` + `decoder.hef`). No whisper.cpp context is involved. WWD and
+STT share the same `HailoTranscriber` instance; the `VDevice` is opened once and
+held for the process lifetime. Memory cost: one VDevice + HEF load, not two.
 
 ---
 
@@ -154,13 +184,22 @@ stored in a vector. `phrase_matches()` checks substring match against all of the
 ```
 Velan start-up
 │
-├─ Speech2TextManager::instance()   ← loads Whisper model, owns on_start + on_done
-├─ WakeWordDetector(ctx)            ← receives shared whisper_context*
-├─ wwd->start()                     ← LISTENING begins
+├─ g_transcriber = make_unique<HailoTranscriber | WhisperTranscriber>(...)
+│                              ← one transcriber for the whole process
+│
+├─ [--test-wav mode] read WAV → g_transcriber->transcribe() → print → exit
+│
+├─ g_llm = TransformerManager(ollama_model, ollama_host)
+├─ g_tts = Text2SpeechManager(tts_model)
+│
+├─ Speech2TextManager::instance(g_transcriber.get(), on_start, on_done, mic)
+│                              ← owns PROCESSING pipeline; receives ITranscriber*
+├─ g_wwd = WakeWordDetector(callback, g_transcriber.get(), phrases, mic)
+├─ g_wwd->start()              ← LISTENING begins
 │
 ├─ WakeWordDetector detect_loop (parallel thread)
-│    └─ VAD-gated sliding window → whisper_full() → phrase match
-│         └─ match → closes mic → callback_() → blocks on cv (PROCESSING)
+│    └─ onset-triggered 1000 ms capture → ITranscriber::transcribe()
+│         → phrase match → closes mic → callback_() → blocks on cv (PROCESSING)
 │
 └─ gRPC poll loop at 10 Hz
        └─ VOICE_ASSIST_TRIGGER changed to 1
@@ -168,18 +207,18 @@ Velan start-up
                           ▼
           Speech2TextManager::handle_trigger()   (idempotent via is_recording_)
                           │
-                          ├─ on_start_()  →  wwd->pause()
+                          ├─ on_start_()  →  g_wwd->pause()
                           │
                           └─ rec_thread_:
                                record_audio()     ← PortAudio, VAD self-terminates
                                process()
-                                 ├─ transcribe()            (whisper.cpp)
-                                 ├─ TransformerManager::chat()
-                                 │    └─ Ollama REST API    (libcurl)
-                                 └─ Text2SpeechManager::speak()
+                                 ├─ ITranscriber::transcribe()
+                                 ├─ g_llm->chat()
+                                 │    └─ Ollama REST API    (libcurl → host PC)
+                                 └─ g_tts->speak()
                                       ├─ fork + exec piper
                                       └─ PortAudio output stream
-                               on_done_()  →  wwd->resume()   (LISTENING resumes)
+                               on_done_()  →  g_wwd->resume()   (LISTENING resumes)
 ```
 
 ---
@@ -192,18 +231,22 @@ decide whether speech is present.
 
 ### WakeWordDetector (`src/WakeWordDetector.cpp`)
 
+WWD uses an **onset-triggered fixed-duration capture** rather than VAD-based end
+detection. Once any chunk crosses the energy threshold, it captures a fixed
+`LOCK_IN_MS` window regardless of per-chunk energy. This prevents mid-word
+phonemes from falling below threshold and producing mostly-silent buffers.
+
 | Parameter | Value | Meaning |
 |-----------|-------|---------|
 | `CHUNK_MS` | 100 ms | mic poll interval; one VAD decision per chunk |
-| `END_SILENCE_CHUNKS` | 5 | 5 × 100 ms = 500 ms of trailing silence ends the utterance |
-| `MIN_PHRASE_FRAMES` | 3200 samples | 200 ms of speech required before Whisper is invoked; ignores very short noise bursts |
-| `MAX_BUFFER_MS` | 5000 ms | hard cap on accumulated speech; prevents unbounded memory if silence is never detected |
-| `vad_threshold` | 0.01 (default) | fixed RMS threshold passed in from `main.cpp`; controls sensitivity |
+| `LOCK_IN_MS` | 1000 ms | fixed capture window after onset — covers longest wake phrase ("Subrahmanya" ≈ 700 ms) |
+| `MIN_PHRASE_MS` | 200 ms | safety floor; always satisfied with 1000 ms capture |
+| `WWD_NOISE_CAL_CHUNKS` | 5 | ~500 ms calibration at startup |
+| `WWD_NOISE_MULTIPLIER` | 1.2× | `eff_threshold = median(cal_rms) × 1.2`; capped at 0.10 |
 
-WWD uses a **fixed threshold** because it only needs to detect whether any sound
-is present — the phrase match itself (Whisper + substring check) provides the
-true signal. False positives in VAD just cause an extra Whisper call, not a
-false trigger.
+**Median calibration**: calibration RMS values are sorted and the median is used
+as the noise floor. This rejects startup transient spikes (keyboard click, AC
+noise) that would inflate a mean-based estimate and set the threshold too high.
 
 ### Speech2TextManager (`src/Speech2TextManager.cpp`)
 
@@ -298,13 +341,25 @@ This is **press-to-start**, not hold-to-talk. STT self-terminates via VAD.
 | VHAL core (`vhal-server`) | gRPC server, property bus | Any ECU |
 | Velan | gRPC client, voice pipeline | Any ECU |
 | `trigger_velan.py` | Test-only trigger client | Development host |
-| Ollama | LLM REST server | Same host as Velan |
-| whisper.cpp | STT + WWD library (shared context) | Linked into Velan binary |
-| Piper | TTS subprocess | Installed on same host |
+| Ollama | LLM REST server | Host PC (RPi deployment) or same host (PC deployment) |
+| whisper.cpp / `WhisperTranscriber` | STT + WWD on CPU/CUDA | Linked into Velan binary |
+| HailoRT / `HailoTranscriber` | STT + WWD on Hailo-8L NPU | Linked into Velan binary (RPi only) |
+| Piper | TTS subprocess | Installed on same host as Velan |
+
+**Ollama location when deploying to RPi:** vhal-core and Ollama both run on the
+host PC. Velan on the RPi connects to Ollama over the LAN. `run_velan.sh`
+auto-detects the PC's LAN IP and passes `--llm <host_ip>` to velan.  Ollama
+must be configured to bind to all interfaces:
+```bash
+OLLAMA_HOST=0.0.0.0 ollama serve
+# or: Environment="OLLAMA_HOST=0.0.0.0" in the systemd service
+```
 
 ---
 
 ## Models
+
+### whisper.cpp mode (CPU/CUDA)
 
 | Model | Path | Used by |
 |-------|------|---------|
@@ -314,6 +369,26 @@ This is **press-to-start**, not hold-to-talk. STT self-terminates via VAD.
 
 Download: `./scripts/download_models.sh`
 
+### Hailo-8L NPU mode
+
+| File | Path | Used by |
+|------|------|---------|
+| `encoder.hef` | `models/stt/whisper-tiny-h8l/` | NPU encoder |
+| `decoder.hef` | `models/stt/whisper-tiny-h8l/` | NPU decoder |
+| `token_embedding_weight_tiny.npy` | `models/stt/whisper-tiny-h8l/weights/` | CPU embedding lookup |
+| `onnx_add_input_tiny.npy` | `models/stt/whisper-tiny-h8l/weights/` | CPU positional encoding |
+| `vocab.json` | `models/stt/whisper-tiny-h8l/weights/` | Detokeniser |
+| `mel_filters_80.npy` | `models/stt/whisper-tiny-h8l/weights/` | Exact whisper mel filterbank |
+
+Generate the weight/vocab files once (any machine with Python):
+```bash
+pip install openai-whisper
+python3 scripts/extract_whisper_weights.py --model tiny \
+        --out models/stt/whisper-tiny-h8l/weights
+```
+
+HEF files are obtained from Hailo's Model Zoo (not in this repo).
+
 ---
 
 ## Source Structure
@@ -321,13 +396,17 @@ Download: `./scripts/download_models.sh`
 ```
 src/
 ├── main.cpp                      CLI, VHAL gRPC polling loop, signal handling, init order
-├── Speech2TextManager.h/.cpp     Singleton: record → STT → LLM → TTS pipeline
+├── Transcriber.h                 ITranscriber interface (transcribe() pure virtual)
+├── WhisperTranscriber.h/.cpp     ITranscriber via whisper.cpp (CPU/CUDA)
+├── HailoTranscriber.h/.cpp       ITranscriber via HailoRT NPU (Hailo-8L)
+├── Speech2TextManager.h/.cpp     Singleton: record → ITranscriber → on_transcript pipeline
 ├── TransformerManager.h/.cpp     Ollama multi-turn conversation (model + history)
 ├── Text2SpeechManager.h/.cpp     Piper TTS subprocess + PortAudio playback
-└── WakeWordDetector.h/.cpp       Whisper sliding-window detector, pause/resume state machine
+└── WakeWordDetector.h/.cpp       Onset-triggered capture → ITranscriber → phrase match
 
 conan/
-└── recipes/whisper/conanfile.py  Local Conan recipe: builds whisper.cpp v1.7.4 as a package
+├── recipes/whisper/conanfile.py  Local Conan recipe: builds whisper.cpp v1.7.4
+└── recipes/portaudio/conanfile.py Local Conan recipe: PortAudio with ALSA
 
 profiles/
 ├── pc                            Conan profile: x86_64 native (build == host)
@@ -336,51 +415,77 @@ profiles/
 conanfile.py                      Root Conan file: all deps + grpc tool_requires
 
 scripts/
-├── build_velan.sh                conan create + conan install + cmake (pc|rpi, cuda|hailo8)
-├── run_velan.sh                  Start vhal-core + velan together; Ctrl-C stops both
-├── deploy_velan.sh               Deploy built binary to RPi over SSH
-└── download_models.sh            Download Whisper medium + Piper models
+├── build_velan.sh                conan install + cmake (pc|rpi, cpu|cuda|hailo8)
+├── deploy_velan.sh               Deploy binary + Piper + models to /opt/car-ui/
+├── run_velan.sh                  Start vhal-core (local) + velan (local or RPi via SSH)
+├── do_all.sh                     build → deploy → run in one command
+├── download_models.sh            Download Whisper medium + Piper binary
+├── download_hailo8_models.sh     Download/check Hailo HEF files
+├── extract_whisper_weights.py    One-time: extract NPU weights + mel filterbank + vocab.json
+├── test_hailo_wav.sh             Generate TTS WAV + SCP to RPi + run --test-wav
+└── sync_rpi_sysroot.sh           Sync RPi sysroot to ~/sdk/rpi/adas
 
 models/
-├── stt/ggml-medium.bin           Whisper medium (shared by STT + WWD)
-└── tts/en_US-lessac-medium.onnx  Piper voice model
+├── stt/ggml-medium.bin                            Whisper medium (CPU/CUDA)
+├── stt/whisper-tiny-h8l/encoder.hef               Hailo NPU encoder
+├── stt/whisper-tiny-h8l/decoder.hef               Hailo NPU decoder
+└── stt/whisper-tiny-h8l/weights/
+    ├── token_embedding_weight_tiny.npy             CPU embedding lookup
+    ├── onnx_add_input_tiny.npy                     CPU positional encoding
+    ├── mel_filters_80.npy                          Whisper's exact mel filterbank
+    └── vocab.json                                  Token-ID → UTF-8 string
 ```
 
 ### Class responsibilities
 
+**`HailoTranscriber`** (new) implements `ITranscriber` for NPU inference:
+- Loads `encoder.hef` + `decoder.hef` via HailoRT `VDevice` + `ConfiguredInferModel`
+- `transcribe(pcm)`: `log_mel()` (CPU, N_FFT=400 mixed-radix, center=True, exact
+  whisper filterbank) → `run_encoder()` (NPU, transpose [mel×frames]→[frames×mel])
+  → `greedy_decode()` (NPU, autoregressive with EOT / repeat / n-gram cycle guards)
+  → `detokenise()` (CPU, vocab.json lookup)
+- All weight .npy files loaded at startup; no hot-path I/O
+- `VDevice` is opened once and held for the process lifetime
+
+**`WhisperTranscriber`** wraps whisper.cpp as `ITranscriber`:
+- Loads ggml model file; exposes `whisper_context*` for sharing
+- `transcribe()` calls `whisper_full()` and extracts text segments
+
 **`Speech2TextManager`** (singleton) owns the PROCESSING pipeline:
-- Loads the Whisper model and initialises PortAudio on construction; throws on failure
-- `handle_trigger()`: entry point for both VHAL and wake-word triggers; idempotent via `is_recording_`
-- Spawns `rec_thread_` which runs `record_audio()` → `process()` → `on_done_()`
-- `record_audio()` uses internal VAD (silence detection) to stop itself
-- Owns `TransformerManager` and `Text2SpeechManager` by value
-- Exposes `get_context()` so `WakeWordDetector` can share the loaded `whisper_context*`
+- Receives `ITranscriber*` and two callbacks (`on_start`, `on_transcript`) on construction
+- `handle_trigger()`: idempotent entry point (guarded by `is_recording_.exchange(true)`)
+- Spawns `rec_thread_` → `record_audio()` (VAD self-terminates) → `transcribe()` → `on_transcript()`
+- `on_transcript` callback (in main.cpp) calls `g_llm->chat()` → `g_tts->speak()` → `g_wwd->resume()`
 
 **`WakeWordDetector`** owns the LISTENING pipeline:
-- Receives the shared `whisper_context*` from `Speech2TextManager` on construction
-- `start()` spawns `detect_loop`; `stop()` sets the stop flag and joins
-- `detect_loop()` runs a VAD-gated sliding window over mic input; calls `whisper_full()` on each speech utterance; fires `callback_()` on phrase match
-- On phrase match: closes its mic stream, calls `callback_()`, then **blocks on a condition variable** until `resume()` is called
-- `pause()` / `resume()`: called by `Speech2TextManager` at LISTENING↔PROCESSING transitions
+- Receives `ITranscriber*`; does **not** own it
+- `detect_loop()`: onset-triggered 1000 ms capture → `ITranscriber::transcribe()` → phrase match
+- On match: closes mic, calls `callback_()`, blocks on `condition_variable` until `resume()`
 
 **`TransformerManager`** owns the LLM interaction:
-- Holds the Ollama model name and the full multi-turn conversation history
-- Seeds the conversation with the Velan system prompt on construction
-- `chat()` sends each transcript to the Ollama REST API and appends both turns to history
+- `chat()` POSTs JSON to `http://<ollama_host>:11434/api/chat` via libcurl
+- Maintains multi-turn history across the session
 
-**`Text2SpeechManager`** owns the speech-output pipeline:
-- `speak()` forks a `piper` subprocess, writes text to its stdin, reads raw 16-bit PCM from stdout, plays it via PortAudio at 22050 Hz
+**`Text2SpeechManager`** owns TTS output:
+- `speak()` forks `piper`, writes text to stdin, reads 16-bit PCM from stdout, plays via PortAudio
 
 ### Initialisation order in main()
 
 ```
-1. Declare wwd (unique_ptr, null)           — lambdas capture by ref; safe before step 4
-2. Speech2TextManager::instance()           — loads Whisper model, stores on_start + on_done
-3. WakeWordDetector(mgr.get_context(), ...) — receives shared context
-4. wwd->start()                             — LISTENING begins
+1. g_transcriber = make_unique<HailoTranscriber | WhisperTranscriber>(...)
+                              ← one shared transcriber instance
+2. [--test-wav] → transcribe WAV → print → return 0   (no TTS/LLM/mic/VHAL needed)
+3. g_llm = TransformerManager(model, ollama_host)
+4. g_tts = Text2SpeechManager(tts_model)
+5. Speech2TextManager::instance(g_transcriber.get(), on_start, on_transcript, mic)
+6. g_wwd = WakeWordDetector(callback, g_transcriber.get(), phrases, mic)
+7. g_wwd->start()             ← LISTENING begins
+8. gRPC poll loop
 ```
 
-This order is required: WWD needs the `whisper_context*`, which only exists after step 2.
+Steps 3–4 are after the `--test-wav` early-exit so TTS/LLM init is not required
+for offline testing. The `on_transcript` lambda in step 5 captures `g_wwd` by
+reference; the pointer is null-safe until step 6.
 
 ### Dependency management
 

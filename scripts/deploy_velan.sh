@@ -77,9 +77,56 @@ esac
 # Source paths
 # ---------------------------------------------------------------------------
 VELAN_BIN="${ROOT_DIR}/build/${TARGET}/velan"
-PIPER_LIB_DIR="${HOME}/.local/lib/piper"
+# Architecture-specific piper lib directories.
+# PC deploys use the native x86_64 install; RPi deploys use the aarch64 tarball
+# cached in a separate directory so the two never overwrite each other.
+PIPER_LIB_DIR_PC="${HOME}/.local/lib/piper"
+PIPER_LIB_DIR_RPI="${HOME}/.local/lib/piper-aarch64"
 MODELS_STT="${ROOT_DIR}/models/stt"
 MODELS_TTS="${ROOT_DIR}/models/tts"
+
+# ---------------------------------------------------------------------------
+# ensure_piper_aarch64 — download the aarch64 piper release if not cached.
+#   Stores binaries + shared libs in PIPER_LIB_DIR_RPI so they never collide
+#   with the native x86_64 install.
+# ---------------------------------------------------------------------------
+PIPER_API_URL="https://api.github.com/repos/rhasspy/piper/releases/latest"
+
+ensure_piper_aarch64() {
+    if [[ -x "${PIPER_LIB_DIR_RPI}/piper" ]]; then
+        info "aarch64 Piper already cached at ${PIPER_LIB_DIR_RPI} — skipping download."
+        return
+    fi
+
+    local tarball="piper_linux_aarch64.tar.gz"
+    local tmp="/tmp/${tarball}"
+
+    info "Resolving latest Piper aarch64 release..."
+    local url
+    url=$(curl -fsSL "$PIPER_API_URL" \
+          | grep -o '"browser_download_url": *"[^"]*'"${tarball}"'"' \
+          | grep -o 'https://[^"]*')
+
+    if [[ -z "$url" ]]; then
+        fail "Could not resolve Piper aarch64 download URL.\n" \
+             "Check https://github.com/rhasspy/piper/releases manually."
+    fi
+
+    info "Downloading Piper aarch64 binary..."
+    curl -fL -# -o "$tmp" "$url"
+
+    if ! gzip -t "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        fail "Downloaded Piper tarball is not a valid gzip archive."
+    fi
+
+    mkdir -p "${PIPER_LIB_DIR_RPI}"
+    tar -xzf "$tmp" -C /tmp
+    cp -r /tmp/piper/. "${PIPER_LIB_DIR_RPI}/"
+    rm -rf "$tmp" /tmp/piper
+
+    success "aarch64 Piper cached → ${PIPER_LIB_DIR_RPI}"
+}
 
 # ---------------------------------------------------------------------------
 # Pre-flight checks
@@ -87,8 +134,10 @@ MODELS_TTS="${ROOT_DIR}/models/tts"
 [[ -x "$VELAN_BIN" ]] || \
     fail "velan binary not found at build/${TARGET}/velan\n       Run: ./scripts/build_velan.sh --target ${TARGET}"
 
-[[ -d "$PIPER_LIB_DIR" ]] || \
-    fail "Piper libs not found at ${PIPER_LIB_DIR}\n       Run: ./scripts/download_models.sh"
+if [[ "$TARGET" == "pc" ]]; then
+    [[ -d "$PIPER_LIB_DIR_PC" ]] || \
+        fail "Piper libs not found at ${PIPER_LIB_DIR_PC}\n       Run: ./scripts/download_models.sh"
+fi
 
 [[ -d "$MODELS_STT" ]] && [[ -n "$(ls -A "$MODELS_STT" 2>/dev/null)" ]] || \
     fail "STT models not found in models/stt/\n       Run: ./scripts/download_models.sh"
@@ -97,7 +146,11 @@ MODELS_TTS="${ROOT_DIR}/models/tts"
     fail "TTS models not found in models/tts/\n       Run: ./scripts/download_models.sh"
 
 info "Velan binary : build/${TARGET}/velan"
-info "Piper libs   : ${PIPER_LIB_DIR}"
+if [[ "$TARGET" == "rpi" ]]; then
+    info "Piper libs   : ${PIPER_LIB_DIR_RPI}  (aarch64)"
+else
+    info "Piper libs   : ${PIPER_LIB_DIR_PC}  (x86_64)"
+fi
 info "STT models   : models/stt/"
 info "TTS models   : models/tts/"
 info "Deploy root  : ${DEPLOY_ROOT}"
@@ -166,6 +219,7 @@ install_runtime_deps() {
 # deploy_pc — copy to /opt/car-ui on the local machine
 # ---------------------------------------------------------------------------
 deploy_pc() {
+    local PIPER_LIB_DIR="${PIPER_LIB_DIR_PC}"
     echo
     info "Deploying to pc at ${DEPLOY_ROOT} ..."
     echo "  The following will be written under ${DEPLOY_ROOT}:"
@@ -192,7 +246,7 @@ deploy_pc() {
     info "Copying velan binary..."
     sudo install -m 0755 "$VELAN_BIN" "${DEPLOY_ROOT}/bin/velan"
 
-    info "Syncing Piper libs..."
+    info "Syncing Piper libs (x86_64)..."
     sudo rsync -a --delete "${PIPER_LIB_DIR}/" "${DEPLOY_ROOT}/lib/piper/"
 
     info "Writing Piper wrapper..."
@@ -226,6 +280,9 @@ deploy_rpi() {
     info "Target RPi   : ${RPI_DEST}"
     info "Deploy root  : ${DEPLOY_ROOT}"
 
+    # Ensure we have the aarch64 piper binary cached locally before touching the RPi
+    ensure_piper_aarch64
+
     # Check SSH connectivity
     info "Checking SSH connectivity to ${RPI_IP} ..."
     if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "${RPI_DEST}" "exit" 2>/dev/null; then
@@ -251,8 +308,8 @@ deploy_rpi() {
     echo
     echo "  The following will be written to ${RPI_DEST}:${DEPLOY_ROOT}:"
     echo "    bin/velan"
-    echo "    bin/piper  (wrapper)"
-    echo "    lib/piper/ (Piper binary + shared libs)"
+    echo "    bin/piper  (wrapper, aarch64)"
+    echo "    lib/piper/ (Piper aarch64 binary + shared libs)"
     echo "    models/stt/"
     echo "    models/tts/"
     echo
@@ -263,9 +320,9 @@ deploy_rpi() {
     scp "$VELAN_BIN" "${RPI_DEST}:${DEPLOY_ROOT}/bin/velan"
     ssh "${RPI_DEST}" "chmod 0755 ${DEPLOY_ROOT}/bin/velan"
 
-    info "Syncing Piper libs..."
+    info "Syncing Piper libs (aarch64)..."
     rsync -a --delete --progress \
-        "${PIPER_LIB_DIR}/" "${RPI_DEST}:${DEPLOY_ROOT}/lib/piper/"
+        "${PIPER_LIB_DIR_RPI}/" "${RPI_DEST}:${DEPLOY_ROOT}/lib/piper/"
 
     info "Writing Piper wrapper..."
     ssh "${RPI_DEST}" \

@@ -54,6 +54,8 @@ usage() {
     echo "  --user <username>    RPi login username (default: \$USER)            [rpi only]"
     echo "  --llm-host <addr>    Ollama server IP/hostname visible from the RPi  [rpi only]"
     echo "                       (default: auto-detect local IP facing the RPi)"
+    echo "  --tts-sink <device>  ALSA sink for TTS aplay fallback               [rpi only]"
+    echo "                       (default: pulse — routes via PulseAudio/PipeWire to BT speaker)"
     echo "  [VELAN OPTIONS]      Remaining args are forwarded to the velan binary"
 }
 
@@ -179,10 +181,26 @@ if [[ "$TARGET" == "rpi" ]]; then
         fi
     fi
 
+    # --- Inject --tts-sink pulse for RPi ---
+    # Bluetooth (and most RPi audio) is managed by PulseAudio/PipeWire.
+    # ALSA's "default" device falls back to dmix which requires hw:0,0 — a card
+    # that may not exist on RPi (cards start at 1).  Routing through the "pulse"
+    # ALSA plugin bypasses dmix and reaches the BT speaker via PulseAudio.
+    # Only inject if the caller hasn't already specified --tts-sink.
+    if ! printf '%s\n' "${VELAN_ARGS[@]}" | grep -q '^--tts-sink$'; then
+        echo "[run] TTS sink (for RPi): pulse  (override with --tts-sink <alsa-device>)"
+        VELAN_ARGS+=("--tts-sink" "pulse")
+    fi
+
     echo "[run] Starting velan on RPi (${RPI_DEST})..."
     # Run SSH in the foreground so the terminal's Ctrl+C propagates through the
     # PTY directly to velan on the RPi, rather than only killing the local SSH client.
+    #
+    # XDG_RUNTIME_DIR is required so paplay (TTS fallback) can find the
+    # PipeWire/PulseAudio socket at /run/user/<uid>/pulse/native.
+    # PAM does not set it when SSH executes a command directly (non-login shell),
+    # so we derive it from the remote UID at connect time.
     ssh -t "$RPI_DEST" \
-        "cd ${DEPLOY_ROOT} && export PATH=${DEPLOY_ROOT}/bin:\$PATH ALSA_CONFIG_DIR=/usr/share/alsa; ./bin/velan ${VELAN_ARGS[*]}" || true
+        "cd ${DEPLOY_ROOT} && export PATH=${DEPLOY_ROOT}/bin:\$PATH ALSA_CONFIG_DIR=/usr/share/alsa XDG_RUNTIME_DIR=/run/user/\$(id -u); ./bin/velan ${VELAN_ARGS[*]}" || true
     # EXIT trap fires here and kills vhal-core (VHAL_PID).
 fi

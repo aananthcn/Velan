@@ -16,10 +16,12 @@ Developed on a **PC with Nvidia GPU** (RTX 5070), then deployed to
 ## Pipeline
 
 ```
-VOICE_ASSIST_TRIGGER (gRPC / vhal-core)
+VOICE_ASSIST_TRIGGER (gRPC / vhal-core)  ─or─  Wake word (mic)
   → Microphone (PortAudio)
-  → whisper.cpp  (STT)
-  → Ollama       (LLM)
+  → ITranscriber:
+      • WhisperTranscriber  (whisper.cpp — CPU / CUDA)
+      • HailoTranscriber    (HailoRT NPU — Hailo-8L on RPi AI HAT+)
+  → Ollama       (LLM — runs on host PC when deployed to RPi)
   → Piper        (TTS)
   → Speaker      (PortAudio)
 ```
@@ -99,7 +101,56 @@ Ollama starts automatically as a systemd service. To verify:
 systemctl status ollama
 ```
 
-### 5. AI models and Piper TTS binary
+#### Ollama for RPi deployment
+
+When Velan runs on the RPi it must reach Ollama on the **host PC** over LAN.
+The systemd Ollama service binds to `127.0.0.1` by default — the RPi cannot
+reach it. Use the provided helper script to restart Ollama bound to all
+interfaces while preserving GPU and flash-attention settings:
+
+```bash
+./scripts/restart_ollama4rpi.sh
+```
+
+This script stops the systemd service (`sudo` required once for the password),
+then starts Ollama with `OLLAMA_HOST=0.0.0.0` and the correct `OLLAMA_MODELS`
+path so all previously downloaded models remain visible.
+
+> **Note:** `run_velan.sh --target rpi` auto-injects `--llm <host_ip>` so the
+> RPi velan binary always points at the right host.  Run
+> `restart_ollama4rpi.sh` on the PC **before** launching `run_velan.sh`.
+
+### 5. RPi runtime packages
+
+The following packages must be installed **on the Raspberry Pi** (not on the
+build PC). They are runtime dependencies — not needed to build Velan.
+
+```bash
+# On the Raspberry Pi:
+sudo apt install -y pulseaudio-utils
+```
+
+| Package | Why |
+|---------|-----|
+| `pulseaudio-utils` | Provides `paplay`, used by Velan's TTS fallback to route audio through PipeWire to a Bluetooth speaker. Required because PortAudio (conan build) cannot open the RPi ALSA device directly. |
+
+> **`pulseaudio-utils` only — do not install `pulseaudio` or `libasound2-plugins`.**
+>
+> - `pulseaudio-utils` ships only CLI tools (`paplay`, `pactl`, …) — no daemon,
+>   no ALSA config changes. `paplay` connects to PipeWire's PulseAudio socket
+>   directly via `libpulse0`, bypassing ALSA entirely.
+> - Installing the full `pulseaudio` package pulls in `libasound2-plugins` as a
+>   dependency. That package redirects the ALSA `default` device to PulseAudio,
+>   which causes PortAudio's `Pa_Initialize()` to crash on startup (the ALSA
+>   pulse plugin conflicts with PipeWire's audio ownership).
+> - If you accidentally installed `pulseaudio`, recover with:
+>   ```bash
+>   sudo apt install pulseaudio-utils   # keep paplay
+>   sudo apt remove pulseaudio libasound2-plugins
+>   sudo apt autoremove
+>   ```
+
+### 6. AI models and Piper TTS binary
 
 ```bash
 ./scripts/download_models.sh
@@ -327,6 +378,10 @@ Starts vhal-core and Velan from `/opt/car-ui/`. Both must be deployed first.
 ./scripts/run_velan.sh --target rpi --ip 192.168.10.30 --user pi
 ```
 
+For the RPi target, the script **auto-detects the host PC's LAN IP** and passes
+`--llm <host_ip>` to velan so it can reach Ollama on the PC.  Override with
+`--llm-host <addr>` if auto-detect picks the wrong interface.
+
 Ctrl-C stops all processes cleanly on both sides.
 
 Extra arguments are forwarded to the Velan binary:
@@ -385,15 +440,22 @@ python3 scripts/extract_whisper_weights.py --model tiny \
 Velan waits for `VOICE_ASSIST_TRIGGER` events from the vhal-core gRPC server.
 VAD (voice activity detection) starts and stops recording automatically.
 
-| Option | Default | Example |
-|--------|---------|---------|
-| `--sttmodel <path>` | `models/stt/ggml-medium.bin` | `models/stt/ggml-small.bin` |
-| `--ttsmodel <path>` | `models/tts/en_US-lessac-medium.onnx` | `models/tts/en_GB-jenny-medium.onnx` |
-| `--llmodel <model>` | `llama3.2:3b` | `gemma4:26b` |
-| `--server <host:port>` | `localhost:50051` | `192.168.1.10:50051` |
-| `--wwphrase <phrase>` | `Hey Vela, Subramanya, Subramani` | `hey jarvis` |
-| `--wwsilence <ms>` | `2000` | `3000` |
-| `--wwtimeout <ms>` | `120000` | `60000` |
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--aicore <mode>` | `whisper` | Transcription backend: `whisper` (CPU/CUDA) or `hailo8` (NPU) |
+| `--sttmodel <path>` | `models/stt/ggml-medium.bin` | Whisper model (whisper aicore only) |
+| `--encoder-hef <path>` | `models/stt/whisper-tiny-h8l/encoder.hef` | Hailo encoder HEF |
+| `--decoder-hef <path>` | `models/stt/whisper-tiny-h8l/decoder.hef` | Hailo decoder HEF |
+| `--vocab-json <path>` | `models/stt/whisper-tiny-h8l/weights/vocab.json` | Hailo vocab file |
+| `--ttsmodel <path>` | `models/tts/en_US-lessac-medium.onnx` | Piper TTS model |
+| `--llmodel <name>` | `llama3.2:3b` | Ollama model name |
+| `--llm <host>` | `localhost` | Ollama server hostname or IP |
+| `--server <host:port>` | `localhost:50051` | VHAL gRPC server address |
+| `--wwphrase <phrases>` | `Hey Vela, Subramanya, Subramani, Subrahmanya` | Comma-separated wake phrases |
+| `--mic <index>` | system default | PortAudio input device index |
+| `--list-mic` | — | Print available microphone devices and exit |
+| `--tts-sink <device>` | system default | ALSA device for TTS `aplay` fallback (e.g. `plughw:0,0`). Use `pulse` to route via PulseAudio/PipeWire — required for Bluetooth speakers on RPi. Auto-injected by `run_velan.sh --target rpi`. |
+| `--test-wav <path>` | — | Transcribe a WAV file (16 kHz mono) and exit; no mic/LLM/TTS needed |
 
 ---
 
@@ -444,11 +506,12 @@ lookup is computed on the CPU (using `.npy` weight files) and the full
 transformer + output projection runs on the NPU. This keeps the large embedding
 table off the NPU while still offloading all attention layers.
 
-### One-time: extract NPU weights
+### One-time: extract NPU weights + mel filterbank
 
 Before the first Hailo build, run the extraction script **once** on any machine
-with Python installed. It downloads the Whisper tiny model, extracts the two
-weight tensors the CPU embedding step needs, and generates the vocabulary file:
+with Python installed. It downloads the Whisper tiny model, extracts the
+weight tensors the CPU embedding step needs, the exact mel filterbank used when
+the ONNX/HEF was compiled, and generates the vocabulary file:
 
 ```bash
 pip install openai-whisper   # also installs numpy
@@ -456,13 +519,14 @@ python3 scripts/extract_whisper_weights.py --model tiny \
         --out models/stt/whisper-tiny-h8l/weights
 ```
 
-This creates three files (re-run only if you change the model size):
+This creates four files (re-run only if you change the model size):
 
 | File | Size | Purpose |
 |------|------|---------|
 | `token_embedding_weight_tiny.npy` | ~75 MB | Decoder input embedding `[vocab × 384]` |
 | `onnx_add_input_tiny.npy` | ~48 KB | Positional encoding `[32 × 384]` |
 | `vocab.json` | ~1 MB | Token-ID → UTF-8 string mapping |
+| `mel_filters_80.npy` | ~64 KB | Whisper's exact mel filterbank `[80 × 201]` |
 
 `deploy_velan.sh` copies the whole `models/` tree to the RPi, so these files
 are automatically deployed alongside the HEF files.
@@ -470,6 +534,18 @@ are automatically deployed alongside the HEF files.
 > **Adjust `--model` to match the HEF.** If the encoder/decoder HEFs were
 > compiled from `whisper-base`, run `--model base`; for `whisper-small`, use
 > `--model small`. Mismatched sizes cause decoder repetition loops.
+
+### Testing with a known WAV (offline, no mic needed)
+
+`scripts/test_hailo_wav.sh` generates a TTS WAV on the host, copies it to the
+RPi, and runs `velan --test-wav` to transcribe it:
+
+```bash
+./scripts/test_hailo_wav.sh --ip 192.168.10.30 --text "Hello Velan"
+```
+
+This validates the full Hailo pipeline (mel → encoder → decoder → text) without
+needing a working microphone or Ollama.
 
 ---
 
@@ -503,11 +579,26 @@ ls -lh models/stt/
 ./scripts/deploy_velan.sh --target pc   # redeploys piper to /opt/car-ui/
 ```
 
-**Ollama connection refused**
+**Ollama connection refused (PC target)**
 
 ```bash
 ollama serve
 ```
+
+**Ollama not reachable from RPi** (`curl: Couldn't connect to server`)
+
+By default Ollama binds to `127.0.0.1` only. The RPi cannot reach it over LAN.
+Use the helper script (run on the **PC**):
+
+```bash
+./scripts/restart_ollama4rpi.sh
+```
+
+This stops the systemd service and restarts Ollama with `OLLAMA_HOST=0.0.0.0`
+and the correct `OLLAMA_MODELS` path (preserves GPU / flash-attention settings).
+
+`run_velan.sh` auto-injects `--llm <host_ip>` for the rpi target — you do not
+need to pass it manually unless the auto-detect picks the wrong interface.
 
 **Conan `Invalid` error during `build_vhal_core.sh`**
 
@@ -529,14 +620,19 @@ Switch to a smaller model in `run_velan.sh`:
 ```
 velan/
 ├── src/
-│   ├── main.cpp                    VHAL gRPC polling loop, CLI, signal handling
-│   ├── WakeWordDetector.h/.cpp     Wake-word detection (shared Whisper context)
-│   ├── Speech2TextManager.h/.cpp   Singleton: PortAudio capture + Whisper STT
-│   ├── TransformerManager.h/.cpp   Ollama conversation history + HTTP chat
+│   ├── main.cpp                    VHAL gRPC loop, CLI, signal handling, init order
+│   ├── Transcriber.h               ITranscriber interface (pure virtual)
+│   ├── WhisperTranscriber.h/.cpp   ITranscriber via whisper.cpp (CPU/CUDA)
+│   ├── HailoTranscriber.h/.cpp     ITranscriber via HailoRT NPU (Hailo-8L)
+│   ├── WakeWordDetector.h/.cpp     Onset-triggered wake-word detection
+│   ├── Speech2TextManager.h/.cpp   Singleton: record → transcribe → on_transcript
+│   ├── TransformerManager.h/.cpp   Ollama multi-turn conversation + HTTP chat
 │   └── Text2SpeechManager.h/.cpp   Piper TTS subprocess + PortAudio playback
 ├── conan/
-│   └── recipes/whisper/
-│       └── conanfile.py            Local Conan recipe for whisper.cpp v1.7.4
+│   ├── recipes/whisper/
+│   │   └── conanfile.py            Local Conan recipe for whisper.cpp v1.7.4
+│   └── recipes/portaudio/
+│       └── conanfile.py            Local Conan recipe for PortAudio (ALSA)
 ├── profiles/
 │   ├── pc                          Conan profile: x86_64 native
 │   └── rpi                         Conan profile: armv8 / aarch64 cross-compile
@@ -545,21 +641,30 @@ velan/
 │   ├── deploy_vhal_core.sh         Deploy vhal-core to /opt/car-ui/
 │   ├── build_velan.sh              Build Velan (Conan + CMake, pc or rpi, optional aicore)
 │   ├── deploy_velan.sh             Deploy Velan binary, Piper, models to /opt/car-ui/
-│   ├── run_velan.sh                Start vhal-core + Velan from /opt/car-ui/
+│   ├── run_velan.sh                Start vhal-core + Velan; auto-injects --llm and --tts-sink for RPi
+│   ├── restart_ollama4rpi.sh       Restart Ollama on PC bound to 0.0.0.0 (required for RPi LAN access)
 │   ├── do_all.sh                   build → deploy → run in one command
 │   ├── download_models.sh          Download Whisper models and Piper binary
-│   └── extract_whisper_weights.py  One-time: extract NPU embedding weights + vocab.json (Hailo)
+│   ├── download_hailo8_models.sh   Check/download Hailo HEF files
+│   ├── extract_whisper_weights.py  One-time: extract NPU weights + mel filterbank + vocab
+│   ├── test_hailo_wav.sh           Generate TTS WAV + run --test-wav on RPi
+│   └── sync_rpi_sysroot.sh         Sync RPi sysroot to ~/sdk/rpi/adas
 ├── models/
 │   ├── stt/                        Whisper model files (gitignored)
+│   │   └── whisper-tiny-h8l/
+│   │       ├── encoder.hef         Hailo encoder (gitignored)
+│   │       ├── decoder.hef         Hailo decoder (gitignored)
+│   │       └── weights/            NPU weight files (gitignored)
 │   └── tts/                        Piper voice model files (gitignored)
 ├── build/
-│   ├── pc/                         PC build output (Conan-generated toolchain + cmake)
+│   ├── pc/                         PC build output
 │   └── rpi/                        RPi cross-compiled build output
 ├── test/
 │   └── trigger_velan.py            Python gRPC client — sends VOICE_ASSIST_TRIGGER
 ├── conanfile.py                    Root Conan file: all C++ dependencies
 ├── CMakeLists.txt
-├── CLAUDE.md
+├── CLAUDE.md                       Design decisions + implementation constraints
+├── ARCHITECTURE.md                 System architecture and component overview
 └── README.md
 ```
 
