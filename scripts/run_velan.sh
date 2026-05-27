@@ -45,15 +45,14 @@ VELAN_ARGS=()
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-LLM_HOST=""   # explicit --llm-host override; empty = auto-detect for rpi
+LLM_HOST=""   # set by --llm <addr>; empty = Ollama runs locally on the RPi
 
 usage() {
-    echo "Usage: $(basename "$0") --target <pc|rpi> [--ip <ip>] [--user <username>] [--llm-host <addr>] [VELAN OPTIONS]"
+    echo "Usage: $(basename "$0") --target <pc|rpi> [--ip <ip>] [--user <username>] [--llm <addr>] [VELAN OPTIONS]"
     echo "  --target <pc|rpi>    Run target: pc (local) or rpi (Raspberry Pi)  [required]"
     echo "  --ip <addr>          RPi IP address (default: 192.168.10.30)        [rpi only]"
     echo "  --user <username>    RPi login username (default: \$USER)            [rpi only]"
-    echo "  --llm-host <addr>    Ollama server IP/hostname visible from the RPi  [rpi only]"
-    echo "                       (default: auto-detect local IP facing the RPi)"
+    echo "  --llm <addr>         Ollama server IP/hostname (default: localhost on RPi) [rpi only]"
     echo "  --tts-sink <device>  ALSA sink for TTS aplay fallback               [rpi only]"
     echo "                       (default: pulse — routes via PulseAudio/PipeWire to BT speaker)"
     echo "  [VELAN OPTIONS]      Remaining args are forwarded to the velan binary"
@@ -72,7 +71,7 @@ while [[ $# -gt 0 ]]; do
             RPI_IP="$2"; shift 2 ;;
         --user)
             RPI_USER="$2"; shift 2 ;;
-        --llm-host)
+        --llm)
             LLM_HOST="$2"; shift 2 ;;
         --help)
             usage; exit 0 ;;
@@ -158,28 +157,71 @@ if [[ "$TARGET" == "rpi" ]]; then
         exit 1
     fi
 
+    # --- Ollama setup ---
+    # Default: Ollama runs locally on the RPi (velan connects to localhost).
+    # Override: pass --llm <addr> to point velan at a different machine's Ollama.
+    if [[ -n "$LLM_HOST" ]]; then
+        # Explicit override — inject and skip RPi setup.
+        echo "[run] Ollama host (override): ${LLM_HOST}"
+        VELAN_ARGS+=("--llm" "${LLM_HOST}")
+    else
+        # Default: install, start, and pull on the RPi itself.
+
+        # Which model does velan need?  Honour --llmodel if the caller passed it.
+        LLM_MODEL="llama3.2:3b"
+        for _i in "${!VELAN_ARGS[@]}"; do
+            if [[ "${VELAN_ARGS[$_i]}" == "--llmodel" ]] && \
+               (( _i + 1 < ${#VELAN_ARGS[@]} )); then
+                LLM_MODEL="${VELAN_ARGS[$(( _i + 1 ))]}"
+            fi
+        done
+
+        # 1. Install Ollama on RPi if not present.
+        #    Use ssh -t to allocate a PTY so the installer's sudo can prompt for a password.
+        if ! ssh "${RPI_DEST}" "command -v ollama &>/dev/null" 2>/dev/null; then
+            echo "[run] Ollama not found on RPi — installing via official installer (may ask for sudo password)..."
+            ssh -t "${RPI_DEST}" "curl -fsSL https://ollama.com/install.sh | sh"
+        fi
+
+        # 2. Start Ollama on RPi if not already running.
+        if ! ssh "${RPI_DEST}" "ss -tlnp 2>/dev/null | grep -q ':11434'" 2>/dev/null; then
+            echo "[run] Starting Ollama on RPi..."
+            ssh "${RPI_DEST}" \
+                "nohup ollama serve &>/tmp/ollama-velan.log </dev/null & disown"
+            echo -n "[run] Waiting for Ollama on RPi..."
+            for _i in {1..15}; do
+                sleep 1
+                if ssh "${RPI_DEST}" \
+                       "ss -tlnp 2>/dev/null | grep -q ':11434'" 2>/dev/null; then
+                    echo " ready."
+                    break
+                fi
+                echo -n "."
+            done
+            if ! ssh "${RPI_DEST}" \
+                     "ss -tlnp 2>/dev/null | grep -q ':11434'" 2>/dev/null; then
+                echo ""
+                echo "[run] ERROR: Ollama failed to start on RPi. Check /tmp/ollama-velan.log"
+                exit 1
+            fi
+        fi
+
+        # 3. Pull the required model on the RPi if not already downloaded.
+        if ! ssh "${RPI_DEST}" \
+                 "ollama list 2>/dev/null | awk 'NR>1{print \$1}' | grep -qx '${LLM_MODEL}'" \
+                 2>/dev/null; then
+            echo "[run] Pulling model '${LLM_MODEL}' on RPi (this may take a few minutes)..."
+            ssh "${RPI_DEST}" "ollama pull ${LLM_MODEL}"
+        fi
+
+        echo "[run] Ollama ready on RPi — model: ${LLM_MODEL}."
+    fi
+
     echo "[run] Starting vhal-core (local)..."
     "$VHAL_CORE" &
     VHAL_PID=$!
 
     sleep 1
-
-    # --- Inject --llm <host_ip> so velan on the RPi can reach Ollama on this PC ---
-    # Only add it if the caller hasn't already passed --llm in VELAN_ARGS.
-    if ! printf '%s\n' "${VELAN_ARGS[@]}" | grep -q '^--llm$'; then
-        if [[ -z "$LLM_HOST" ]]; then
-            # Auto-detect: which local IP does the kernel route toward the RPi?
-            LLM_HOST=$(ip route get "${RPI_IP}" 2>/dev/null \
-                       | grep -oP 'src \K[\d.]+' | head -1)
-        fi
-        if [[ -n "$LLM_HOST" ]]; then
-            echo "[run] Ollama host (for RPi): ${LLM_HOST}  (override with --llm-host <addr>)"
-            VELAN_ARGS+=("--llm" "${LLM_HOST}")
-        else
-            echo "[run] WARNING: could not detect local IP — velan will try Ollama at localhost."
-            echo "[run]          Pass --llm-host <your_pc_ip> if Ollama isn't on the RPi."
-        fi
-    fi
 
     # --- Inject --tts-sink pulse for RPi ---
     # Bluetooth (and most RPi audio) is managed by PulseAudio/PipeWire.
