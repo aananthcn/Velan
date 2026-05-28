@@ -28,8 +28,9 @@ public:
     WhisperTranscriber& operator=(const WhisperTranscriber&) = delete;
 
     std::string transcribe(const std::vector<float>& pcm,
-                           bool single_segment = false,
-                           int  audio_ctx      = 0) override;
+                           bool               single_segment = false,
+                           int                audio_ctx      = 0,
+                           const std::string& initial_prompt = "") override;
 
 private:
     whisper_context*      ctx_;

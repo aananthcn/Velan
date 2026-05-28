@@ -77,6 +77,7 @@ esac
 # Source paths
 # ---------------------------------------------------------------------------
 VELAN_BIN="${ROOT_DIR}/build/${TARGET}/velan"
+VELAN_UI_BIN="${ROOT_DIR}/build/${TARGET}/src/ui/velan-ui"
 # Architecture-specific piper lib directories.
 # PC deploys use the native x86_64 install; RPi deploys use the aarch64 tarball
 # cached in a separate directory so the two never overwrite each other.
@@ -146,6 +147,11 @@ fi
     fail "TTS models not found in models/tts/\n       Run: ./scripts/download_models.sh"
 
 info "Velan binary : build/${TARGET}/velan"
+if [[ -x "$VELAN_UI_BIN" ]]; then
+    info "velan-ui     : build/${TARGET}/src/ui/velan-ui"
+else
+    info "velan-ui     : not built (run build_velan.sh with Qt available to include it)"
+fi
 if [[ "$TARGET" == "rpi" ]]; then
     info "Piper libs   : ${PIPER_LIB_DIR_RPI}  (aarch64)"
 else
@@ -224,6 +230,9 @@ deploy_pc() {
     info "Deploying to pc at ${DEPLOY_ROOT} ..."
     echo "  The following will be written under ${DEPLOY_ROOT}:"
     echo "    bin/velan"
+    if [[ -x "$VELAN_UI_BIN" ]]; then
+    echo "    bin/velan-ui"
+    fi
     echo "    bin/piper  (wrapper)"
     echo "    lib/piper/ (Piper binary + shared libs)"
     echo "    models/stt/"
@@ -246,6 +255,11 @@ deploy_pc() {
     info "Copying velan binary..."
     sudo install -m 0755 "$VELAN_BIN" "${DEPLOY_ROOT}/bin/velan"
 
+    if [[ -x "$VELAN_UI_BIN" ]]; then
+        info "Copying velan-ui binary..."
+        sudo install -m 0755 "$VELAN_UI_BIN" "${DEPLOY_ROOT}/bin/velan-ui"
+    fi
+
     info "Syncing Piper libs (x86_64)..."
     sudo rsync -a --delete "${PIPER_LIB_DIR}/" "${DEPLOY_ROOT}/lib/piper/"
 
@@ -265,6 +279,9 @@ EOF
     success "Deployed to ${DEPLOY_ROOT}."
     echo
     echo "  Binary   : ${DEPLOY_ROOT}/bin/velan"
+    if [[ -x "$VELAN_UI_BIN" ]]; then
+    echo "  UI       : ${DEPLOY_ROOT}/bin/velan-ui"
+    fi
     echo "  Piper    : ${DEPLOY_ROOT}/bin/piper  →  lib/piper/"
     echo "  STT      : ${DEPLOY_ROOT}/models/stt/"
     echo "  TTS      : ${DEPLOY_ROOT}/models/tts/"
@@ -308,6 +325,11 @@ deploy_rpi() {
     echo
     echo "  The following will be written to ${RPI_DEST}:${DEPLOY_ROOT}:"
     echo "    bin/velan"
+    if [[ -x "$VELAN_UI_BIN" ]]; then
+    echo "    bin/velan-ui   (cross-compiled on PC)"
+    else
+    echo "    bin/velan-ui   (NOT built — rebuild with Qt6 available for rpi target)"
+    fi
     echo "    bin/piper  (wrapper, aarch64)"
     echo "    lib/piper/ (Piper aarch64 binary + shared libs)"
     echo "    models/stt/"
@@ -319,6 +341,12 @@ deploy_rpi() {
     info "Copying velan binary..."
     scp "$VELAN_BIN" "${RPI_DEST}:${DEPLOY_ROOT}/bin/velan"
     ssh "${RPI_DEST}" "chmod 0755 ${DEPLOY_ROOT}/bin/velan"
+
+    if [[ -x "$VELAN_UI_BIN" ]]; then
+        info "Copying velan-ui binary (cross-compiled)..."
+        scp "$VELAN_UI_BIN" "${RPI_DEST}:${DEPLOY_ROOT}/bin/velan-ui"
+        ssh "${RPI_DEST}" "chmod 0755 ${DEPLOY_ROOT}/bin/velan-ui"
+    fi
 
     info "Syncing Piper libs (aarch64)..."
     rsync -a --delete --progress \
@@ -340,6 +368,11 @@ deploy_rpi() {
     success "Deployed to ${RPI_DEST}:${DEPLOY_ROOT}."
     echo
     echo "  Binary   : ${DEPLOY_ROOT}/bin/velan"
+    if [[ -x "$VELAN_UI_BIN" ]]; then
+    echo "  UI       : ${DEPLOY_ROOT}/bin/velan-ui  (cross-compiled)"
+    else
+    echo "  UI       : not deployed  (rebuild with: ./scripts/build_velan.sh --target rpi)"
+    fi
     echo "  Piper    : ${DEPLOY_ROOT}/bin/piper  →  lib/piper/"
     echo "  STT      : ${DEPLOY_ROOT}/models/stt/"
     echo "  TTS      : ${DEPLOY_ROOT}/models/tts/"

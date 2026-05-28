@@ -34,6 +34,7 @@
 #include "Speech2TextManager.h"
 #include "Text2SpeechManager.h"
 #include "TransformerManager.h"
+#include "UIServer.h"
 #include "WakeWordDetector.h"
 #include "WhisperTranscriber.h"
 #ifdef GGML_USE_HAILO8
@@ -64,6 +65,7 @@ static std::unique_ptr<ITranscriber>       g_transcriber;
 static std::unique_ptr<TransformerManager> g_llm;
 static std::unique_ptr<Text2SpeechManager> g_tts;
 static std::unique_ptr<WakeWordDetector>   g_wwd;
+static std::unique_ptr<UIServer>           g_ui;
 
 
 // Vendor-defined VHAL property for voice assistant trigger.
@@ -91,6 +93,7 @@ struct VelanConfigs {
     int         mic_device      = -1;   // -1 = PortAudio system default; override with --mic
     std::string tts_sink        = "";   // ALSA device for aplay fallback (e.g. "plughw:0,0")
     std::string test_wav        = "";   // if non-empty: transcribe this WAV file and exit
+    std::string ui_port         = "50052";  // gRPC UI server port; empty = disabled
 };
 
 
@@ -130,6 +133,7 @@ static void print_help(const char* prog) {
         << "  --list-mic              Print available microphone devices and exit\n"
         << "  --tts-sink    <device>  ALSA device for TTS aplay fallback (e.g. plughw:0,0)\n"
         << "  --test-wav  <path>      Transcribe a WAV file (16 kHz mono PCM) and exit\n"
+        << "  --ui-port   <port>      gRPC UI server port (default: 50052; 0 = disabled)\n"
         << "  --help                  Show this help\n\n"
         << "Defaults:\n"
         << "  STT model     : " << DEFAULT_STT_MODEL      << "\n"
@@ -236,6 +240,13 @@ static bool parse_cmdline(int argc, char* argv[], VelanConfigs& cfg) {
                 return false;
             }
             cfg.test_wav = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "--ui-port") == 0) {
+            if ((i + 1) >= argc) {
+                std::cerr << "[Velan] Missing value for --ui-port\n";
+                return false;
+            }
+            cfg.ui_port = argv[++i];
         }
         else if (std::strcmp(argv[i], "--list-mic") == 0) {
             Pa_Initialize();
@@ -380,8 +391,10 @@ static void chat_with_ai_model(const std::string& text) {
         if (g_llm) {
             try {
                 std::cout << log_ts() << "[Velan] Thinking...\n";
+                if (g_ui) g_ui->notify(velan::THINKING, text);
                 std::string reply = g_llm->chat(text);
                 std::cout << log_ts() << "[Velan] Assistant: " << reply << "\n\n";
+                if (g_ui) g_ui->notify(velan::TALKING, text, reply);
                 g_tts->speak(reply);
             } catch (const std::exception& e) {
                 std::cerr << log_ts() << "[Velan] Ollama error: " << e.what() << "\n";
@@ -391,6 +404,7 @@ static void chat_with_ai_model(const std::string& text) {
         }
     }
     if (g_wwd) g_wwd->resume();     // PROCESSING → LISTENING
+    if (g_ui)  g_ui->notify(velan::LISTENING);
 }
 
 
@@ -435,7 +449,16 @@ int main(int argc, char* argv[]) {
         std::cout << log_ts() << "[Velan] TTS ALSA sink  : system default\n";
     else
         std::cout << log_ts() << "[Velan] TTS ALSA sink  : " << cfg.tts_sink << "\n";
+    std::cout << log_ts() << "[Velan] UI server port : "
+              << (cfg.ui_port.empty() || cfg.ui_port == "0" ? "disabled" : cfg.ui_port) << "\n";
     std::cout << log_ts() << "[Velan] =====================================\n";
+
+    // ---- UI gRPC server (optional — disabled if --ui-port 0) ----
+    if (!cfg.ui_port.empty() && cfg.ui_port != "0") {
+        g_ui = std::make_unique<UIServer>("0.0.0.0:" + cfg.ui_port);
+        g_ui->start();
+        g_ui->notify(velan::IDLE);
+    }
 
     // ---- Transcriber: one model instance shared by STT and WWD ----
     try {
@@ -490,7 +513,10 @@ int main(int argc, char* argv[]) {
     try {
         mgr_ptr = &Speech2TextManager::instance(
             g_transcriber.get(),
-            []()                        { if (g_wwd) g_wwd->pause(); },   // LISTENING → PROCESSING
+            []() {                                          // LISTENING → RECORDING
+                if (g_wwd) g_wwd->pause();
+                if (g_ui)  g_ui->notify(velan::RECORDING);
+            },
             [](const std::string& text) { chat_with_ai_model(text);  },   // transcript → LLM → TTS → resume
             cfg.mic_device
         );
@@ -510,6 +536,7 @@ int main(int argc, char* argv[]) {
             cfg.mic_device
         );
         g_wwd->start();
+        if (g_ui) g_ui->notify(velan::LISTENING);
     } catch (const std::exception& e) {
         std::cerr << "[Velan] Wake word detector failed to start: " << e.what() << "\n";
         std::cerr << "[Velan] Continuing with VHAL trigger only.\n";
@@ -575,7 +602,26 @@ int main(int argc, char* argv[]) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    if (g_wwd) g_wwd->stop();
+    // ---- Ordered shutdown ------------------------------------------------
+    // Each component must be torn down while its dependencies are still alive.
+    // Relying on global-static destructor order is not safe:
+    //   - The CUDA runtime registers its own atexit() handlers which tear down
+    //     the CUDA context before C++ static destructors run.  If g_transcriber
+    //     is destroyed via a static destructor, whisper_free() → cudaFree() fires
+    //     after the driver is already gone → "CUDA error: driver shutting down".
+    //   - g_ui has a gRPC server thread.  If it is destroyed via static dtor,
+    //     the "Client disconnected" log line appears after the shell prompt.
+    // Explicit resets here fix both races.
+
+    if (g_wwd) {
+        g_wwd->stop();   // sets running_=false, detaches detect_loop thread
+        g_wwd.reset();   // ~WakeWordDetector: 200 ms drain + Pa_Terminate
+    }
+    g_ui.reset();        // gRPC Shutdown → WatchState exits → "Client disconnected"
+                         // then server_thread_.join(); all UI output before Bye.
+    g_tts.reset();
+    g_llm.reset();
+    g_transcriber.reset(); // whisper_free() → cudaFree() while CUDA driver alive
 
     std::cout << "[Velan] Bye.\n";
     return 0;

@@ -20,11 +20,32 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <regex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
-#define WWD_DEFAULT_WAKE_WORDS "Hey Vela, Subramanya, Subramani, Subrahmanya, Supramani, Brahmani, Subraman"
+// Default wake phrases / patterns.
+//
+// Phrases prefixed with "regex:" are compiled as ECMAScript case-insensitive
+// regular expressions and matched against the normalised Whisper transcript
+// via std::regex_search.  All other phrases use the existing case-insensitive
+// substring match.
+//
+// Pattern rationale for "Subramanya":
+//   The second syllable starts with 'b', so the common prefix is "su" and the
+//   alternatives are (bro|bra|brah):
+//     su + bra  + man + ya  →  subramanya
+//     su + brah + man + ya  →  subrahmanya   (Whisper inserts silent 'h')
+//     su + bro  + man + ya  →  subromanya    (rare Whisper variant)
+//   Endings: (i|ya) — covers both "Subramani" and "Subramanya" spellings.
+//   A second pattern covers the 'p'-consonant variants Whisper occasionally
+//   produces (supramanya, suprahmanya, etc.).
+#define WWD_DEFAULT_WAKE_WORDS \
+    "regex:Hey (V|B)ell?a(h|n), " \
+    "regex:su(bro|bra|brah)man(i|ya), " \
+    "regex:su(pro|pra|prah)man(i|ya)"
 
 // Continuously listens on the microphone in LISTENING state.
 // When the wake phrase is detected, fires callback() and blocks until
@@ -62,7 +83,13 @@ private:
 
     TriggerCallback          callback_;
     ITranscriber*            transcriber_;   // non-owning; owned by main()
-    std::vector<std::string> wake_phrases_;  // each stored lower-case, punctuation-free
+    std::vector<std::string> wake_phrases_;  // plain substrings — lower-case, punct-free
+
+    // Regex patterns — compiled once in the constructor.
+    // Stored as (source_string, compiled_regex) pairs so the source is
+    // available for logging without recompiling.
+    std::vector<std::pair<std::string, std::regex>> wake_patterns_;
+
     float                    vad_threshold_;
     int                      mic_device_;    // PortAudio device index; -1 = default
     std::atomic<bool>        running_;

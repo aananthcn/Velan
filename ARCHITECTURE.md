@@ -2,8 +2,8 @@
 
 ## Role
 
-Velan is a **gRPC client**. It connects to a VHAL core server and polls for a
-vendor-defined trigger property. It does not expose any server port of its own.
+Velan is a **gRPC client** (connects to VHAL core) and simultaneously a
+**gRPC server** (streams assistant state to any connected UI client on port 50052).
 
 ---
 
@@ -24,36 +24,41 @@ vendor-defined trigger property. It does not expose any server port of its own.
 └───────────────────────────────────────┼─────────────┘
                                         │ GetValues (10 Hz poll)
                                         ▼
-                              ┌─────────────────┐
-                              │     Velan        │
-                              │  (gRPC client)  │
-                              └────────┬────────┘
-                                       │
-             ┌─────────────────────────┴──────────────────────┐
-             │  VHAL gRPC trigger                              │  Wake word
-             │  prop == 0x21400001                             │  (ITranscriber)
-             │                                                 │
-             │  TRIGGER_ON  (1) ──────────────────────────────►│
-             │  TRIGGER_OFF (0) ── ignored (VAD stops STT)     │
-             │                                                 │
-             └──────────────────┬──────────────────────────────┘
-                                │  both call
-                                ▼
-                  Speech2TextManager::handle_trigger()
-                                │
-                                ▼
-                  LISTENING → PROCESSING transition
-                  wwd->pause()  (WWD blocks on cv)
-                                │
-                                ▼
-                  record_audio()   ← VAD self-terminates
-                  transcribe()     ← ITranscriber (whisper.cpp or Hailo-8L NPU)
-                  chat()           ← Ollama REST API
-                  speak()          ← Piper TTS → PortAudio
-                                │
-                                ▼
-                  PROCESSING → LISTENING transition
-                  wwd->resume()  (WWD unblocks)
+                              ┌──────────────────────┐
+                              │        Velan          │
+                              │  gRPC client :50051   │
+                              │  gRPC server :50052   │◄─── velan-ui (any host)
+                              └──────────┬────────────┘
+                                         │
+             ┌───────────────────────────┴─────────────────────┐
+             │  VHAL gRPC trigger                               │  Wake word
+             │  prop == 0x21400001                              │  (ITranscriber)
+             │                                                  │
+             │  TRIGGER_ON  (1) ───────────────────────────────►│
+             │  TRIGGER_OFF (0) ── ignored (VAD stops STT)      │
+             │                                                  │
+             └───────────────────┬──────────────────────────────┘
+                                 │  both call
+                                 ▼
+                   Speech2TextManager::handle_trigger()
+                   UIServer::notify(RECORDING)
+                                 │
+                                 ▼
+                   LISTENING → PROCESSING transition
+                   wwd->pause()  (WWD blocks on cv)
+                                 │
+                                 ▼
+                   record_audio()   ← VAD self-terminates
+                   transcribe()     ← ITranscriber (whisper.cpp or Hailo-8L NPU)
+                   UIServer::notify(THINKING, transcript)
+                   chat()           ← Ollama REST API
+                   UIServer::notify(TALKING, transcript, response)
+                   speak()          ← Piper TTS → PortAudio
+                                 │
+                                 ▼
+                   PROCESSING → LISTENING transition
+                   wwd->resume()  (WWD unblocks)
+                   UIServer::notify(LISTENING)
 ```
 
 ---
@@ -83,7 +88,9 @@ via VAD silence detection.
 
 ---
 
-## gRPC Contract
+## gRPC Contracts
+
+### VHAL (client side)
 
 Velan uses the `VehicleServer` service defined in vhal-core:
 
@@ -101,6 +108,36 @@ Velan compares each result against the previous value and acts only on a rising
 edge (0 → 1). This polling pattern matches what `vhal-gateway` uses and avoids
 the server-side write failures that `StartPropertyValuesStream` produces when
 FakeVehicleHardware pushes updates from a different thread.
+
+### VelanUIService (server side)
+
+Defined in `proto/velan_ui.proto`. Velan starts a gRPC server on `--ui-port`
+(default 50052) and implements one RPC:
+
+| RPC | Direction | Purpose |
+|-----|-----------|---------|
+| `WatchState` | Server-streaming | Push `StateUpdate` on every pipeline state change |
+
+```
+enum AssistantState { IDLE=0, LISTENING=1, RECORDING=2, THINKING=3, TALKING=4 }
+
+message StateUpdate {
+    AssistantState state      = 1;
+    int64  timestamp_ms       = 2;
+    string transcript         = 3;   // set when → THINKING
+    string response           = 4;   // set when → TALKING
+}
+```
+
+`UIServer` (implemented in `src/UIServer.cpp`) runs on a background thread.
+`notify()` is called from the voice pipeline and broadcasts to all connected
+clients. If no client is connected the call is a no-op.
+
+`velan-ui` (Qt Quick app in `src/ui/`) is the reference UI client. It can run
+on any networked host — connect with:
+```bash
+velan-ui --server <velan-host>:50052
+```
 
 ---
 
@@ -339,7 +376,8 @@ This is **press-to-start**, not hold-to-talk. STT self-terminates via VAD.
 | Component | Role | Runs where |
 |-----------|------|-----------|
 | VHAL core (`vhal-server`) | gRPC server, property bus | Any ECU |
-| Velan | gRPC client, voice pipeline | Any ECU |
+| Velan | gRPC client (VHAL) + gRPC server (UI :50052), voice pipeline | Any ECU |
+| `velan-ui` | Qt Quick Siri-orb UI, gRPC client to Velan :50052 | Any networked host |
 | `trigger_velan.py` | Test-only trigger client | Development host |
 | Ollama | LLM REST server | Host PC (RPi deployment) or same host (PC deployment) |
 | whisper.cpp / `WhisperTranscriber` | STT + WWD on CPU/CUDA | Linked into Velan binary |
@@ -394,15 +432,25 @@ HEF files are obtained from Hailo's Model Zoo (not in this repo).
 ## Source Structure
 
 ```
+proto/
+└── velan_ui.proto                VelanUIService definition (AssistantState stream)
+
 src/
 ├── main.cpp                      CLI, VHAL gRPC polling loop, signal handling, init order
+├── UIServer.h/.cpp               gRPC server: streams AssistantState to velan-ui clients
 ├── Transcriber.h                 ITranscriber interface (transcribe() pure virtual)
 ├── WhisperTranscriber.h/.cpp     ITranscriber via whisper.cpp (CPU/CUDA)
 ├── HailoTranscriber.h/.cpp       ITranscriber via HailoRT NPU (Hailo-8L)
 ├── Speech2TextManager.h/.cpp     Singleton: record → ITranscriber → on_transcript pipeline
 ├── TransformerManager.h/.cpp     Ollama multi-turn conversation (model + history)
 ├── Text2SpeechManager.h/.cpp     Piper TTS subprocess + PortAudio playback
-└── WakeWordDetector.h/.cpp       Onset-triggered capture → ITranscriber → phrase match
+├── WakeWordDetector.h/.cpp       Onset-triggered capture → ITranscriber → phrase match
+└── ui/                           Qt Quick Siri-orb UI (built if Qt6 found)
+    ├── main.cpp                  QGuiApplication + QQmlEngine, --server CLI arg
+    ├── GrpcStateWatcher.h/.cpp   QThread: streams WatchState RPC, emits stateChanged()
+    ├── main.qml                  Window, state wiring, status overlay, transcript label
+    ├── SiriOrb.qml               Animated orb component (5 states, breathing/swirl/colour)
+    └── qml.qrc                   Qt resource bundle
 
 conan/
 ├── recipes/whisper/conanfile.py  Local Conan recipe: builds whisper.cpp v1.7.4
@@ -519,9 +567,33 @@ Conan profiles: `profiles/pc` (x86_64), `profiles/rpi` (armv8 / aarch64).
 ./scripts/build_velan.sh --target rpi --aicore hailo8       # Raspberry Pi, Hailo-8 NPU
 ```
 
+`velan-ui` is built automatically when Qt6 is detected. To install Qt6:
+```bash
+sudo apt install qt6-base-dev qt6-declarative-dev
+```
+To skip the UI build: `cmake -DBUILD_UI=OFF …`
+
 Prerequisites:
 - `pip install conan && conan profile detect` (once per machine)
 - `sudo apt install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu` (rpi target only)
+
+### Running with UI
+
+```bash
+# PC (UI on same machine):
+./scripts/run_velan.sh --target pc
+
+# RPi (UI on PC, Velan on RPi):
+./scripts/run_velan.sh --target rpi --llm 192.168.10.1
+
+# RPi (UI on a different machine, e.g. laptop at 192.168.10.50):
+./scripts/run_velan.sh --target rpi --llm 192.168.10.1 --no-ui
+# On the laptop:
+velan-ui --server 192.168.10.30:50052
+
+# Disable UI server entirely:
+./scripts/run_velan.sh --target rpi --ui-port 0
+```
 
 First rpi build: Conan builds gRPC + abseil from source for aarch64 (~30–60 min).
 Subsequent builds use `~/.conan2` binary cache.

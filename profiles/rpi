@@ -1,15 +1,19 @@
-# Conan host profile — Raspberry Pi 5 (aarch64 / armv8, GCC 11).
+# Conan host profile — Raspberry Pi 5 (aarch64 / armv8, GCC 12).
 # Use with: --profile:host=profiles/rpi --profile:build=profiles/pc
 [settings]
 os=Linux
 arch=armv8
 compiler=gcc
-compiler.version=11
+compiler.version=12
 compiler.libcxx=libstdc++11
 compiler.cppstd=17
 build_type=Release
 
 [conf]
-# Absolute paths prevent CMake's internal find_program() from accidentally
-# picking up the ARM64 cross-compiler binaries inside the RPi sysroot.
-tools.build:compiler_executables={"c": "/usr/bin/aarch64-linux-gnu-gcc", "cpp": "/usr/bin/aarch64-linux-gnu-g++", "strip": "/usr/bin/aarch64-linux-gnu-strip"}
+# GCC 12 cross-compiler (Ubuntu 22.04 package: gcc-12-aarch64-linux-gnu).
+# Using explicit -12 suffix ensures the right version is always selected
+# regardless of the /usr/bin/aarch64-linux-gnu-gcc symlink target.
+tools.build:compiler_executables={"c": "/usr/bin/aarch64-linux-gnu-gcc-12", "cpp": "/usr/bin/aarch64-linux-gnu-g++-12", "strip": "/usr/bin/aarch64-linux-gnu-strip"}
+# Note: the sysroot toolchain (profiles/rpi-sysroot-toolchain.cmake) is chained
+# via --conf in build_velan.sh rather than here, so the path resolves at
+# build time without hardcoding an absolute repo path in this file.

@@ -55,8 +55,9 @@ WhisperTranscriber::~WhisperTranscriber() {
 
 
 std::string WhisperTranscriber::transcribe(const std::vector<float>& pcm,
-                                            bool single_segment,
-                                            int  audio_ctx) {
+                                            bool               single_segment,
+                                            int                audio_ctx,
+                                            const std::string& initial_prompt) {
     if (pcm.empty()) return {};
 
     // whisper_full_with_state rejects audio < 1000 ms due to mel-frame rounding
@@ -79,8 +80,34 @@ std::string WhisperTranscriber::transcribe(const std::vector<float>& pcm,
     p.print_realtime   = false;
     p.print_timestamps = false;
     p.single_segment   = single_segment;
+    // initial_prompt primes the decoder with expected vocabulary.  Used in WWD
+    // mode to anchor the beam search toward the wake-phrase words before decoding
+    // starts.  This is the most effective fix for proper-noun hallucinations.
+    if (!initial_prompt.empty())
+        p.initial_prompt = initial_prompt.c_str();
+    // no_context: when an initial_prompt is set it already provides context, so
+    // we still disable cross-segment context accumulation (each window is independent).
     p.no_context       = true;
-    if (audio_ctx > 0) p.audio_ctx = audio_ctx;
+    if (audio_ctx > 0) {
+        p.audio_ctx = audio_ctx;
+        // WWD mode — optimise for speed, not quality.  We only need phrase
+        // matching; the repetition-loop and noise-pattern filters handle
+        // anything Whisper produces on a bad clip.
+        //
+        // 1. Lower no_speech_thold so near-silence emits [BLANK_AUDIO]
+        //    without triggering any temperature fallback.
+        p.no_speech_thold = 0.4f;   // default 0.6
+
+        // 2. Disable temperature fallback retries entirely.
+        //    Without initial_prompt (removed because it caused 100% repetition
+        //    loops), the default thresholds (entropy_thold=2.4, logprob_thold=-1.0)
+        //    are exceeded by most 1-second clips that contain trailing silence,
+        //    firing 4–6 retries at ~500 ms each on CUDA → 2000–5000 ms total.
+        //    Setting them to ±∞ means inference always runs exactly once.
+        //    Note: LOOSEN (not tighten) these thresholds to suppress retries.
+        p.entropy_thold  =  100.0f; // default 2.4  — never trigger entropy retry
+        p.logprob_thold  = -100.0f; // default -1.0 — never trigger logprob retry
+    }
 
     if (whisper_full(ctx_, p, src->data(), static_cast<int>(src->size())) != 0)
         return {};

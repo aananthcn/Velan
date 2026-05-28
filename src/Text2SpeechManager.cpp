@@ -76,7 +76,7 @@ void Text2SpeechManager::speak(const std::string& text) {
     close(from_piper[1]);
 
     const std::string line = text + "\n";
-    write(to_piper[1], line.c_str(), line.size());
+    (void)write(to_piper[1], line.c_str(), line.size());
     close(to_piper[1]);
 
     std::vector<int16_t> samples;

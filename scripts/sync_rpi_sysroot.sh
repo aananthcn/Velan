@@ -65,10 +65,13 @@ echo "[sdk] SSH OK."
 # ---------------------------------------------------------------------------
 DEV_PKGS=(
     portaudio19-dev
-    libasound2-dev      # ALSA — required by portaudio cross-build (PA_USE_ALSA)
+    libasound2-dev          # ALSA — required by portaudio cross-build (PA_USE_ALSA)
     libcurl4-openssl-dev
     libgrpc++-dev
     libprotobuf-dev
+    qt6-base-dev            # Qt6 core libs + cmake configs for velan-ui
+    qt6-declarative-dev     # Qt Quick / QML
+    qt6-declarative-dev-tools  # qmlimportscanner (needed for qt_add_resources)
 )
 
 echo "[sdk] Installing dev packages on RPi..."

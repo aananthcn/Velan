@@ -35,6 +35,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm")
     add_compile_options(-march=armv8.2-a+fp16+dotprod -mtune=cortex-a76)
 endif()
 
+
 # ---------------------------------------------------------------------------
 # AI accelerator support
 # ---------------------------------------------------------------------------
@@ -147,6 +148,41 @@ foreach(_d ${_proto_incdirs})
 endforeach()
 
 # ---------------------------------------------------------------------------
+# UI proto code generation — velan_ui.proto lives in proto/ in this repo
+# ---------------------------------------------------------------------------
+set(UI_PROTO_DIR  "${CMAKE_SOURCE_DIR}/proto")
+set(UI_PROTO_GEN_DIR "${CMAKE_BINARY_DIR}/ui_proto_gen")
+file(MAKE_DIRECTORY "${UI_PROTO_GEN_DIR}")
+
+add_custom_command(
+    OUTPUT
+        "${UI_PROTO_GEN_DIR}/velan_ui.pb.cc"
+        "${UI_PROTO_GEN_DIR}/velan_ui.pb.h"
+        "${UI_PROTO_GEN_DIR}/velan_ui.grpc.pb.cc"
+        "${UI_PROTO_GEN_DIR}/velan_ui.grpc.pb.h"
+    COMMAND ${PROTOC_EXE}
+    ARGS
+        "--cpp_out=${UI_PROTO_GEN_DIR}"
+        "--grpc_out=${UI_PROTO_GEN_DIR}"
+        "--plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN_EXE}"
+        "-I${UI_PROTO_DIR}"
+        ${PROTOC_INCLUDE_ARGS}
+        "${UI_PROTO_DIR}/velan_ui.proto"
+    DEPENDS "${UI_PROTO_DIR}/velan_ui.proto"
+    VERBATIM
+)
+
+add_library(velan_ui_proto STATIC
+    "${UI_PROTO_GEN_DIR}/velan_ui.pb.cc"
+    "${UI_PROTO_GEN_DIR}/velan_ui.grpc.pb.cc"
+)
+target_include_directories(velan_ui_proto PUBLIC "${UI_PROTO_GEN_DIR}")
+target_link_libraries(velan_ui_proto PUBLIC
+    protobuf::libprotobuf
+    gRPC::grpc++
+)
+
+# ---------------------------------------------------------------------------
 # VHAL proto code generation — proto files live in vhal-core, not here
 # ---------------------------------------------------------------------------
 set(VHAL_PROTO_DIR "/home/aananth/labs/networking/vhal-core/test/vhal")
@@ -235,6 +271,7 @@ target_link_libraries(velan_proto PUBLIC
 # ---------------------------------------------------------------------------
 set(VELAN_SOURCES
     src/main.cpp
+    src/UIServer.cpp
     src/WhisperTranscriber.cpp
     src/Speech2TextManager.cpp
     src/TransformerManager.cpp
@@ -255,7 +292,9 @@ target_link_libraries(velan PRIVATE
     CURL::libcurl
     nlohmann_json::nlohmann_json
     velan_proto
+    velan_ui_proto
 )
+target_include_directories(velan PRIVATE "${UI_PROTO_GEN_DIR}")
 
 if(GGML_CUDA)
     # /usr/local/cuda/lib64 is not in the compiler's default search path,
@@ -271,3 +310,33 @@ endif()
 # Install
 # ---------------------------------------------------------------------------
 install(TARGETS velan DESTINATION bin)
+
+# ---------------------------------------------------------------------------
+# velan-ui — Qt Quick Siri-orb UI (optional; requires Qt6 Quick + Network)
+# Disable with: cmake -DBUILD_UI=OFF
+# ---------------------------------------------------------------------------
+option(BUILD_UI "Build the velan-ui Qt Quick assistant UI" ON)
+
+if(BUILD_UI)
+    # When cross-compiling, tell Qt6 this is a shared-library build so it resolves
+    # QML plugin paths from the sysroot without trying to statically link plugins
+    # that are not available in the cross-compilation scope.
+    if(CMAKE_CROSSCOMPILING)
+        set(QT6_IS_SHARED_LIBS_BUILD TRUE)
+    endif()
+    find_package(Qt6 QUIET COMPONENTS Core Qml Quick QuickControls2)
+    if(Qt6_FOUND)
+        # qt_standard_project_setup sets CMAKE_AUTOMOC/AUTORCC in the way that
+        # avoids the qmlcache dependency cycle with qt6_add_qml_module.
+        # Available since Qt 6.3; safe here because the auto-detect ensures
+        # we only reach this block when the online installer Qt (6.8+) is found.
+        if(Qt6_VERSION VERSION_GREATER_EQUAL "6.8")
+            qt_policy(SET QTP0004 NEW)
+        endif()
+        qt_standard_project_setup(REQUIRES 6.3)
+        add_subdirectory(src/ui)
+    else()
+        message(STATUS "velan-ui: Qt6 not found — skipping UI build")
+        message(STATUS "  Install: sudo apt install qt6-base-dev qt6-declarative-dev qt6-declarative-dev-tools")
+    endif()
+endif()

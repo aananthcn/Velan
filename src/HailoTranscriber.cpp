@@ -1260,8 +1260,9 @@ HailoTranscriber::~HailoTranscriber() = default;
 
 
 std::string HailoTranscriber::transcribe(const std::vector<float>& pcm,
-                                          bool  /*single_segment*/,
-                                          int   /*audio_ctx*/) {
+                                          bool               /*single_segment*/,
+                                          int                /*audio_ctx*/,
+                                          const std::string& /*initial_prompt*/) {
     if (pcm.empty()) return {};
 
     try {

@@ -49,8 +49,11 @@ public:
     HailoTranscriber& operator=(const HailoTranscriber&) = delete;
 
     std::string transcribe(const std::vector<float>& pcm,
-                           bool single_segment = false,
-                           int  audio_ctx      = 0) override;
+                           bool               single_segment = false,
+                           int                audio_ctx      = 0,
+                           const std::string& initial_prompt = "") override;
+                           // initial_prompt: accepted for interface compatibility;
+                           // not applicable to the HEF/NPU decode path.
 
 private:
     struct Impl;

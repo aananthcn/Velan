@@ -32,11 +32,18 @@ public:
     // Transcribe PCM audio (16 kHz, mono, float32) to text.
     // Returns empty string on failure or when the audio contains no speech.
     //
-    // single_segment: true for short wake-word clips (forces one output segment);
-    //                 false for user-utterance STT (natural multi-sentence output).
-    // audio_ctx:      encoder context window in mel frames (0 = model default).
-    //                 Set to 128 (~1.3 s) for wake-word to speed up CPU inference.
+    // single_segment:  true for short wake-word clips (forces one output segment);
+    //                  false for user-utterance STT (natural multi-sentence output).
+    // audio_ctx:       encoder context window in mel frames (0 = model default).
+    //                  Set to 128 (~1.3 s) for wake-word to speed up CPU inference.
+    // initial_prompt:  decoder context hint — text the model treats as preceding the
+    //                  audio.  For wake-word mode pass the wake phrases (e.g.
+    //                  "Subramanya Subramani Hey Vela") so the decoder is anchored to
+    //                  the expected vocabulary before it starts.  This dramatically
+    //                  reduces hallucinations on out-of-dictionary proper nouns.
+    //                  Empty string = no hint (default for STT).
     virtual std::string transcribe(const std::vector<float>& pcm,
-                                   bool single_segment = false,
-                                   int  audio_ctx      = 0) = 0;
+                                   bool               single_segment  = false,
+                                   int                audio_ctx       = 0,
+                                   const std::string& initial_prompt  = "") = 0;
 };

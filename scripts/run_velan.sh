@@ -41,6 +41,9 @@ TARGET=""
 RPI_IP="192.168.10.30"
 RPI_USER="${USER}"
 VELAN_ARGS=()
+UI_PORT="50052"     # gRPC UI server port; empty/0 = disabled
+NO_UI=0             # set by --no-ui
+UI_TARGET=""        # set by --ui <pc|rpi>; defaults to $TARGET after parsing
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -50,11 +53,16 @@ LLM_HOST=""   # set by --llm <addr>; empty = Ollama runs locally on the RPi
 usage() {
     echo "Usage: $(basename "$0") --target <pc|rpi> [--ip <ip>] [--user <username>] [--llm <addr>] [VELAN OPTIONS]"
     echo "  --target <pc|rpi>    Run target: pc (local) or rpi (Raspberry Pi)  [required]"
+    echo "  --ui <pc|rpi>        Where to launch velan-ui (default: same as --target)"
+    echo "                         pc  — run velan-ui locally on this PC"
+    echo "                         rpi — run velan-ui on the RPi via SSH (needs DISPLAY)"
     echo "  --ip <addr>          RPi IP address (default: 192.168.10.30)        [rpi only]"
     echo "  --user <username>    RPi login username (default: \$USER)            [rpi only]"
     echo "  --llm <addr>         Ollama server IP/hostname (default: localhost on RPi) [rpi only]"
     echo "  --tts-sink <device>  ALSA sink for TTS aplay fallback               [rpi only]"
     echo "                       (default: pulse — routes via PulseAudio/PipeWire to BT speaker)"
+    echo "  --ui-port <port>     gRPC UI server port on Velan (default: 50052; 0 = disabled)"
+    echo "  --no-ui              Do not launch velan-ui (Velan still exposes the port)"
     echo "  [VELAN OPTIONS]      Remaining args are forwarded to the velan binary"
 }
 
@@ -73,6 +81,17 @@ while [[ $# -gt 0 ]]; do
             RPI_USER="$2"; shift 2 ;;
         --llm)
             LLM_HOST="$2"; shift 2 ;;
+        --ui-port)
+            UI_PORT="$2"; shift 2 ;;
+        --ui)
+            UI_TARGET="$2"
+            if [[ "$UI_TARGET" != "pc" && "$UI_TARGET" != "rpi" ]]; then
+                echo "Error: --ui must be 'pc' or 'rpi', got '$UI_TARGET'"
+                usage; exit 1
+            fi
+            shift 2 ;;
+        --no-ui)
+            NO_UI=1; shift ;;
         --help)
             usage; exit 0 ;;
         *)
@@ -83,6 +102,15 @@ done
 if [[ -z "$TARGET" ]]; then
     echo "Error: --target is required"
     usage; exit 1
+fi
+
+# Default --ui to --target when not explicitly set.
+UI_TARGET="${UI_TARGET:-$TARGET}"
+
+# --ui rpi only makes sense when velan itself runs on the RPi.
+if [[ "$UI_TARGET" == "rpi" && "$TARGET" == "pc" ]]; then
+    echo "[run] Warning: --ui rpi ignored when --target pc; using --ui pc."
+    UI_TARGET="pc"
 fi
 
 DEPLOY_ROOT="/opt/car-ui"
@@ -114,14 +142,74 @@ fi
 # ---------------------------------------------------------------------------
 VHAL_PID=
 VELAN_PID=
+UI_PID=
+_CLEANUP_DONE=0
 
 cleanup() {
+    # Guard against double-invocation: the INT/TERM handler fires cleanup()
+    # and then the script exits normally, triggering the EXIT handler again.
+    [[ "$_CLEANUP_DONE" == "1" ]] && return
+    _CLEANUP_DONE=1
     echo ""
     echo "[run] Shutting down..."
+    [[ -n "$UI_PID"    ]] && kill "$UI_PID"    2>/dev/null || true
     [[ -n "$VELAN_PID" ]] && kill "$VELAN_PID" 2>/dev/null || true
     [[ -n "$VHAL_PID"  ]] && kill "$VHAL_PID"  2>/dev/null || true
     wait 2>/dev/null || true
     echo "[run] Done."
+}
+
+# Helper: start velan-ui locally if the binary exists and --no-ui was not set.
+# UI connects to <host>:<UI_PORT> after Velan is ready.
+launch_ui() {
+    local server_addr="$1"
+    if [[ "$NO_UI" == "1" || "$UI_PORT" == "0" ]]; then return; fi
+    local VELAN_UI="${DEPLOY_ROOT}/bin/velan-ui"
+    if [[ ! -x "$VELAN_UI" ]]; then
+        echo "[run] velan-ui not found at ${VELAN_UI} — skipping UI"
+        echo "[run]   (build with -DBUILD_UI=ON, then deploy_velan.sh)"
+        return
+    fi
+    echo "[run] Starting velan-ui on PC (server: ${server_addr}, nice=5)..."
+    # Run at nice=5 so velan's audio/Whisper threads (nice=0) always win CPU
+    # when both processes compete on the same core.
+    nice -n 5 "$VELAN_UI" --server "${server_addr}" &
+    UI_PID=$!
+}
+
+# Launch velan-ui on the RPi via SSH (used when --ui rpi, which is the default
+# for --target rpi).  velan-ui connects to localhost:${UI_PORT} because both
+# velan and the UI are on the same machine.
+#
+# The SSH client process (UI_PID) stays alive while velan-ui runs remotely.
+# cleanup() kills UI_PID; SSH closing its TCP connection causes the remote
+# SSH server to deliver SIGHUP to velan-ui, which Qt handles with a clean exit.
+#
+# Display environment: DISPLAY=:0 covers the common RPi + HDMI/DSI X11 setup.
+# For Wayland set WAYLAND_DISPLAY=wayland-0 (and drop DISPLAY) in your
+# /opt/car-ui environment or pass it via --ui-env (not yet implemented).
+launch_ui_on_rpi() {
+    if [[ "$NO_UI" == "1" || "$UI_PORT" == "0" ]]; then return; fi
+    if ! ssh -o ConnectTimeout=5 "${RPI_DEST}" \
+             "test -x ${DEPLOY_ROOT}/bin/velan-ui" 2>/dev/null; then
+        echo "[run] velan-ui not found at ${DEPLOY_ROOT}/bin/velan-ui on ${RPI_DEST} — skipping UI"
+        echo "[run]   (build with -DBUILD_UI=ON, then deploy_velan.sh --target rpi)"
+        return
+    fi
+    echo "[run] Starting velan-ui on RPi (server: localhost:${UI_PORT})..."
+    # -tt forces PTY allocation even though stdin is /dev/null.
+    # With a PTY, closing the SSH client (via cleanup() → kill $UI_PID) sends
+    # SIGHUP to the remote PTY's foreground process group, so velan-ui on the
+    # RPi terminates reliably on Ctrl+C from the PC.  Without -tt, killing the
+    # local SSH client leaves velan-ui running as an orphan on the RPi.
+    # Output is redirected to a log file to avoid mixing with the terminal.
+    ssh -tt "${RPI_DEST}" \
+        "export PATH=${DEPLOY_ROOT}/bin:\$PATH \
+                XDG_RUNTIME_DIR=/run/user/\$(id -u) \
+                DISPLAY=:0; \
+         exec ${DEPLOY_ROOT}/bin/velan-ui --server localhost:${UI_PORT}" \
+        </dev/null >>/tmp/velan-ui-rpi.log 2>&1 &
+    UI_PID=$!
 }
 
 trap cleanup INT TERM EXIT
@@ -136,9 +224,15 @@ if [[ "$TARGET" == "pc" ]]; then
 
     sleep 1
 
+    # Inject --ui-port so Velan starts its gRPC UI server.
+    VELAN_ARGS+=("--ui-port" "${UI_PORT}")
+
     echo "[run] Starting velan (local)..."
     (cd "$DEPLOY_ROOT" && "$VELAN" "${VELAN_ARGS[@]}") &
     VELAN_PID=$!
+
+    sleep 1
+    launch_ui "localhost:${UI_PORT}"
 
     wait "$VELAN_PID"
 fi
@@ -217,6 +311,9 @@ if [[ "$TARGET" == "rpi" ]]; then
         echo "[run] Ollama ready on RPi — model: ${LLM_MODEL}."
     fi
 
+    # Inject --ui-port so Velan starts its gRPC UI server on the RPi.
+    VELAN_ARGS+=("--ui-port" "${UI_PORT}")
+
     echo "[run] Starting vhal-core (local)..."
     "$VHAL_CORE" &
     VHAL_PID=$!
@@ -242,7 +339,18 @@ if [[ "$TARGET" == "rpi" ]]; then
     # PipeWire/PulseAudio socket at /run/user/<uid>/pulse/native.
     # PAM does not set it when SSH executes a command directly (non-login shell),
     # so we derive it from the remote UID at connect time.
+
+    # Launch velan-ui on the chosen target.
+    # --ui rpi (default): run on RPi, connects to localhost.
+    # --ui pc :           run on this PC, connects to RPi over LAN (old behaviour).
+    sleep 1
+    if [[ "$UI_TARGET" == "rpi" ]]; then
+        launch_ui_on_rpi
+    else
+        launch_ui "${RPI_IP}:${UI_PORT}"
+    fi
+
     ssh -t "$RPI_DEST" \
         "cd ${DEPLOY_ROOT} && export PATH=${DEPLOY_ROOT}/bin:\$PATH ALSA_CONFIG_DIR=/usr/share/alsa XDG_RUNTIME_DIR=/run/user/\$(id -u); ./bin/velan ${VELAN_ARGS[*]}" || true
-    # EXIT trap fires here and kills vhal-core (VHAL_PID).
+    # EXIT trap fires here and kills vhal-core and velan-ui (VHAL_PID, UI_PID).
 fi

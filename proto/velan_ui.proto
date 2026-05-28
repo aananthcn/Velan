@@ -1,0 +1,49 @@
+// Copyright 2026 Aananth C N
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+package velan;
+
+// ---------------------------------------------------------------------------
+// VelanUIService — server-streaming RPC that pushes assistant state changes
+// to any connected UI client (velan-ui Qt app, dashboards, etc.).
+//
+// Velan acts as the gRPC SERVER on --ui-port (default 50052).
+// velan-ui acts as the gRPC CLIENT that calls WatchState() and animates.
+// ---------------------------------------------------------------------------
+service VelanUIService {
+    // Open a persistent stream; Velan pushes a StateUpdate on every transition.
+    // The stream stays open until the client disconnects or Velan shuts down.
+    rpc WatchState(WatchRequest) returns (stream StateUpdate);
+}
+
+message WatchRequest {
+    string client_id = 1;   // optional label shown in Velan logs
+}
+
+// Assistant state — strict ordering matches the voice pipeline progression.
+enum AssistantState {
+    IDLE      = 0;   // startup / shutdown — orb hidden / motionless
+    LISTENING = 1;   // WakeWordDetector owns mic — waiting for wake phrase
+    RECORDING = 2;   // mic open, user is speaking their question
+    THINKING  = 3;   // LLM query in flight
+    TALKING   = 4;   // TTS playing — Velan is speaking
+}
+
+message StateUpdate {
+    AssistantState state      = 1;
+    int64  timestamp_ms       = 2;   // ms since Unix epoch (for latency tracking)
+    string transcript         = 3;   // set when state == THINKING (what user said)
+    string response           = 4;   // set when state == TALKING  (what Velan says)
+}
