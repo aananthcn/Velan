@@ -183,9 +183,14 @@ target_link_libraries(velan_ui_proto PUBLIC
 )
 
 # ---------------------------------------------------------------------------
-# VHAL proto code generation — proto files live in vhal-core, not here
+# VHAL proto code generation — proto files come from the vhal-proto Conan package.
+# The package exposes an include dir containing VehicleServer.proto at the root
+# and android/hardware/automotive/vehicle/*.proto beneath it.
 # ---------------------------------------------------------------------------
-set(VHAL_PROTO_DIR "/home/aananth/labs/networking/vhal-core/test/vhal")
+find_package(vhal-proto CONFIG REQUIRED)
+get_target_property(_vhal_incdirs vhal-proto::vhal-proto INTERFACE_INCLUDE_DIRECTORIES)
+list(GET _vhal_incdirs 0 VHAL_PROTO_DIR)
+message(STATUS "VHAL proto dir: ${VHAL_PROTO_DIR}")
 set(VHAL_PROTO_GEN_DIR "${CMAKE_BINARY_DIR}/vhal_proto_gen")
 file(MAKE_DIRECTORY "${VHAL_PROTO_GEN_DIR}")
 

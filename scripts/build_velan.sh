@@ -255,6 +255,19 @@ fi
 # Re-runs are fast (no-op if package already in ~/.conan2 cache).
 # ---------------------------------------------------------------------------
 
+# vhal-proto: VHAL gRPC protobuf definitions from vhal-core.
+# Platform-independent header-library (no settings → same binary for pc+rpi).
+VHAL_CORE_DIR="${HOME}/labs/networking/vhal-core"
+if [[ ! -d "${VHAL_CORE_DIR}/packages/vhal-proto" ]]; then
+    echo "[build] ERROR: vhal-core not found at ${VHAL_CORE_DIR}"
+    echo "[build]        Clone or symlink vhal-core there, or set VHAL_CORE_DIR."
+    exit 1
+fi
+echo "[build] Conan: creating vhal-proto package (cached after first run)..."
+conan create "${VHAL_CORE_DIR}/packages/vhal-proto" \
+    --version 1.0 \
+    --build=missing
+
 # portaudio: upstream recipe auto-detects JACK from the build host and compiles
 # pa_jack.c, but never declares libjack in system_libs — causing linker failures
 # when cross-compiling for aarch64.  Our local recipe adds PA_USE_JACK=OFF.

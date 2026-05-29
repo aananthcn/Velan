@@ -92,10 +92,15 @@ via VAD silence detection.
 
 ### VHAL (client side)
 
-Velan uses the `VehicleServer` service defined in vhal-core:
+Velan uses the `VehicleServer` service defined in vhal-core. The proto files are
+consumed as a Conan package (`vhal-proto/1.0` from
+`~/labs/networking/vhal-core/packages/vhal-proto/`) rather than via a hardcoded
+path. `CMakeLists.txt` resolves the proto directory at configure time:
 
-```
-~/labs/networking/vhal-core/test/vhal/VehicleServer.proto
+```cmake
+find_package(vhal-proto CONFIG REQUIRED)
+get_target_property(_dirs vhal-proto::vhal-proto INTERFACE_INCLUDE_DIRECTORIES)
+list(GET _dirs 0 VHAL_PROTO_DIR)
 ```
 
 One RPC is called repeatedly at 10 Hz:
@@ -209,10 +214,24 @@ held for the process lifetime. Memory cost: one VDevice + HEF load, not two.
 ./velan --wwphrase "Hey Vela, Subramanya, Subramani, Subrahmanya"
 ```
 
-Default: `"Hey Vela, Subramanya, Subramani, Subrahmanya"`
+Phrases prefixed with `regex:` are compiled as ECMAScript case-insensitive regular
+expressions and matched via `std::regex_search`. All other phrases use
+case-insensitive substring match after normalisation (lower-case, punctuation → spaces,
+runs collapsed).
 
-Each phrase is normalised (lower-case, punctuation → spaces, runs collapsed) and
-stored in a vector. `phrase_matches()` checks substring match against all of them.
+Default (`WWD_DEFAULT_WAKE_WORDS` in `WakeWordDetector.h`):
+
+```
+regex:Hey (V|B)ell?a(h|n)           ← "Hey Vela/Bella/Velan" + phonetic variants
+regex:su(bro|bra|brah)man(i|ya)      ← "Subramanya / Subrahmanya" etc.
+regex:su(pro|pra|prah)man(i|ya)      ← 'p' consonant variants Whisper occasionally produces
+```
+
+Plain-substring and regex patterns are stored separately:
+- `wake_phrases_` — normalised plain substrings (vector)
+- `wake_patterns_` — `(source_string, compiled_regex)` pairs (vector)
+
+`phrase_matches()` tests both vectors; the first hit fires the trigger.
 
 ---
 
@@ -453,8 +472,9 @@ src/
     └── qml.qrc                   Qt resource bundle
 
 conan/
-├── recipes/whisper/conanfile.py  Local Conan recipe: builds whisper.cpp v1.7.4
-└── recipes/portaudio/conanfile.py Local Conan recipe: PortAudio with ALSA
+├── recipes/whisper/conanfile.py     Local Conan recipe: builds whisper.cpp v1.7.4
+└── recipes/portaudio/conanfile.py   Local Conan recipe: PortAudio with PA_USE_JACK=OFF
+                                     (vhal-proto recipe lives in vhal-core, not here)
 
 profiles/
 ├── pc                            Conan profile: x86_64 native (build == host)
@@ -547,6 +567,7 @@ gRPC/Protobuf/PortAudio/libcurl packages needed.
 | libcurl | `libcurl/8.6.0` | Ollama REST API |
 | nlohmann/json | `nlohmann_json/3.11.3` | JSON parsing |
 | whisper.cpp | local recipe `conan/recipes/whisper/` | STT + WWD |
+| vhal-proto | `vhal-proto/1.0` (from vhal-core) | VHAL proto files; `protoc` input for VHAL gRPC stubs |
 
 `grpc/1.54.3` is declared as both a `requires` (library for the target) and a
 `tool_requires` (protoc + grpc_cpp_plugin for the build machine), guaranteeing

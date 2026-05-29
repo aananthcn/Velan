@@ -13,6 +13,7 @@ class VelanConan(ConanFile):
         self.requires("libcurl/8.6.0")
         self.requires("nlohmann_json/3.11.3")
         self.requires("whisper.cpp/1.7.4")     # local recipe in conan/recipes/whisper/
+        self.requires("vhal-proto/1.0")        # VHAL proto files from vhal-core
 
     def build_requirements(self):
         # grpc_cpp_plugin must run on the build machine.
