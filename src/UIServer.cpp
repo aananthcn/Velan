@@ -97,7 +97,7 @@ grpc::Status UIServer::WatchState(grpc::ServerContext*                    ctx,
 // notify — broadcast state update to all live clients.
 // Called from the voice pipeline (any thread). Non-blocking for the caller.
 // ---------------------------------------------------------------------------
-void UIServer::notify(velan::AssistantState state,
+void UIServer::notify(velan::VoiceAssistantState state,
                        const std::string& transcript,
                        const std::string& response)
 {

@@ -40,7 +40,7 @@ public:
 
 signals:
     // Emitted on every StateUpdate received from Velan.
-    // state maps to velan::AssistantState (0=IDLE … 4=TALKING).
+    // state maps to velan::VoiceAssistantState (0=IDLE … 4=TALKING).
     void stateChanged(int state, const QString& transcript, const QString& response);
 
     // Emitted when the gRPC connection is established or lost.

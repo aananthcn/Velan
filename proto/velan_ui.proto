@@ -15,12 +15,17 @@
 syntax = "proto3";
 package velan;
 
+import "VoiceAssistantState.proto";
+
 // ---------------------------------------------------------------------------
 // VelanUIService — server-streaming RPC that pushes assistant state changes
 // to any connected UI client (velan-ui Qt app, dashboards, etc.).
 //
 // Velan acts as the gRPC SERVER on --ui-port (default 50052).
 // velan-ui acts as the gRPC CLIENT that calls WatchState() and animates.
+//
+// The VoiceAssistantState enum is the canonical definition shared with other
+// ECUs via the vhal-proto Conan package (velan/VoiceAssistantState.proto).
 // ---------------------------------------------------------------------------
 service VelanUIService {
     // Open a persistent stream; Velan pushes a StateUpdate on every transition.
@@ -32,18 +37,9 @@ message WatchRequest {
     string client_id = 1;   // optional label shown in Velan logs
 }
 
-// Assistant state — strict ordering matches the voice pipeline progression.
-enum AssistantState {
-    IDLE      = 0;   // startup / shutdown — orb hidden / motionless
-    LISTENING = 1;   // WakeWordDetector owns mic — waiting for wake phrase
-    RECORDING = 2;   // mic open, user is speaking their question
-    THINKING  = 3;   // LLM query in flight
-    TALKING   = 4;   // TTS playing — Velan is speaking
-}
-
 message StateUpdate {
-    AssistantState state      = 1;
-    int64  timestamp_ms       = 2;   // ms since Unix epoch (for latency tracking)
-    string transcript         = 3;   // set when state == THINKING (what user said)
-    string response           = 4;   // set when state == TALKING  (what Velan says)
+    VoiceAssistantState state      = 1;
+    int64  timestamp_ms            = 2;   // ms since Unix epoch (for latency tracking)
+    string transcript              = 3;   // set when state == THINKING (what user said)
+    string response                = 4;   // set when state == TALKING  (what Velan says)
 }

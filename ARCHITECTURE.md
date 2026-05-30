@@ -414,6 +414,100 @@ OLLAMA_HOST=0.0.0.0 ollama serve
 
 ---
 
+## Multi-Node Deployment
+
+### ECU Network Topology
+
+```
+192.168.10.10  Cluster   — instrument cluster display (Linux/QNX, Yocto + Conan)
+192.168.10.20  IVI       — in-vehicle infotainment; owns mic + speakers
+192.168.10.30  ADAS      — AI compute node; owns LLM + NPU transcriber
+```
+
+IPs are provisioned at **end-of-line (EOL)** per ECU role, not per serial number. The same
+IP is assigned to every unit of the same type across the fleet — no discovery mechanism needed.
+
+### VHAL as the Universal Bus
+
+All inter-ECU signalling goes through VHAL properties. Every node runs its own vhal-core
+instance; vhal-core is responsible for cross-node property federation. Nodes read and write
+only their local vhal-core and remain agnostic to which physical ECU owns a property.
+
+This is the same pattern already proven for RVC (Rear View Camera) communication between
+IVI and Cluster on this network. Federation latency is negligible in practice.
+
+### Vendor VHAL Properties
+
+| Property | ID | Type | Written by | Purpose |
+|----------|----|------|-----------|---------|
+| `VOICE_ASSIST_TRIGGER` | `0x21400001` | INT32 | IVI (button/HMI) | Start voice session (1=on, 0=ignored) |
+| `VELAN_STATE`          | `0x21400002` | INT32 | phase owner (see below) | Current pipeline state enum |
+| `VELAN_TRANSCRIPT`     | `0x21400003` | STRING | IVI/Cluster (STT done) | User utterance; triggers LLM on ADAS |
+| `VELAN_RESPONSE`       | `0x21400004` | STRING | ADAS (LLM done) | Velan reply; triggers TTS on IVI/Cluster |
+
+`VELAN_STATE` values mirror `AssistantState` in `velan_ui.proto`:
+`0=IDLE, 1=LISTENING, 2=RECORDING, 3=THINKING, 4=TALKING`
+
+### Distributed Pipeline
+
+Audio functions (mic, STT, TTS, wake-word) run on the ECU with audio hardware (IVI or
+Cluster). LLM inference runs on ADAS. VHAL properties carry the handoff between the two
+compute domains.
+
+```
+[IVI / Cluster]                              [ADAS]
+
+mic
+→ WakeWordDetector  ─── or ───  VOICE_ASSIST_TRIGGER
+→ record_audio() / STT
+→ VHAL: VELAN_TRANSCRIPT ──────────────────► LLM chat()
+→ VHAL: VELAN_STATE = THINKING               → VHAL: VELAN_RESPONSE
+                                             → VHAL: VELAN_STATE = TALKING
+◄── VHAL: VELAN_RESPONSE ──────────────────
+→ TTS speak() → speaker
+→ VHAL: VELAN_STATE = LISTENING
+```
+
+Each node writes only the properties it owns based on the pipeline phase it is executing.
+No direct cross-node gRPC connections are required between IVI/Cluster and ADAS.
+
+### `--role` Flag (planned)
+
+The Velan binary will gain a `--role` flag so the same codebase covers all deployment modes:
+
+| Role | Runs on | Active components |
+|------|---------|------------------|
+| `full` | single ECU (dev/PC) | WWD + STT + LLM + TTS (current behaviour) |
+| `audio` | IVI / Cluster | WWD + STT + TTS; writes `VELAN_TRANSCRIPT`, reads `VELAN_RESPONSE` |
+| `brain` | ADAS | LLM only; reads `VELAN_TRANSCRIPT`, writes `VELAN_RESPONSE` |
+
+### velan-ui Portability
+
+`velan-ui` remains the developer/demo UI. It connects to Velan's `UIServer` gRPC service
+(`WatchState` stream on port 50052) for a rich push stream including transcript and response
+text. It is deployable on ADAS (with display) or Cluster without recompile:
+
+```bash
+velan-ui --server 192.168.10.30:50052
+```
+
+IVI and Cluster production UIs consume `VELAN_STATE` from their local vhal-core instead —
+no direct connection to ADAS required.
+
+### Open Work Items
+
+| Item | Owner | Notes |
+|------|-------|-------|
+| Cross-node property federation | vhal-core | Required for all cross-ECU properties |
+| `VELAN_STATE` write in pipeline callbacks | Velan | Replace / supplement `UIServer::notify()` calls |
+| `VELAN_TRANSCRIPT` write after STT | Velan (`audio` role) | Triggers LLM on ADAS |
+| `VELAN_RESPONSE` poll/subscribe + TTS | Velan (`audio` role) | Receives LLM result from ADAS |
+| `VELAN_TRANSCRIPT` poll + LLM dispatch | Velan (`brain` role) | Receives transcript, runs chat() |
+| `--role` flag in `main.cpp` | Velan | Activates subset of pipeline components |
+| Register new property IDs in vhal-core | vhal-core | `0x21400002–04` alongside `0x21400001` |
+
+---
+
 ## Models
 
 ### whisper.cpp mode (CPU/CUDA)

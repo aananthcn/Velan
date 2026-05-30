@@ -28,7 +28,7 @@
 
 
 // ---------------------------------------------------------------------------
-// UIServer — gRPC server that streams AssistantState updates to connected
+// UIServer — gRPC server that streams VoiceAssistantState updates to connected
 // velan-ui clients.
 //
 // Usage:
@@ -56,7 +56,7 @@ public:
 
     // Broadcast a state change to all connected streaming clients.
     // transcript is set when state == THINKING; response when state == TALKING.
-    void notify(velan::AssistantState state,
+    void notify(velan::VoiceAssistantState state,
                 const std::string& transcript = "",
                 const std::string& response   = "");
 

@@ -1,7 +1,7 @@
 // Copyright 2026 Aananth C N
 // Apache License, Version 2.0
 //
-// Siri-like orb that animates based on AssistantState:
+// Siri-like orb that animates based on VoiceAssistantState:
 //   0 IDLE      — tiny grey, motionless
 //   1 LISTENING — medium blue, slow breathing pulse
 //   2 RECORDING — larger orange-red, fast pulse

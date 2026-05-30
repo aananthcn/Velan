@@ -148,12 +148,47 @@ foreach(_d ${_proto_incdirs})
 endforeach()
 
 # ---------------------------------------------------------------------------
-# UI proto code generation — velan_ui.proto lives in proto/ in this repo
+# vhal-proto Conan package — proto files for VHAL + VoiceAssistantState enum.
+# Must be resolved before any proto compilation step that imports these files.
+# ---------------------------------------------------------------------------
+find_package(vhal-proto CONFIG REQUIRED)
+get_target_property(_vhal_incdirs vhal-proto::vhal-proto INTERFACE_INCLUDE_DIRECTORIES)
+list(GET _vhal_incdirs 0 VHAL_PROTO_DIR)
+# Conan wraps header-library include dirs in a generator expression like
+# $<$<CONFIG:Release>:/real/path>.  Extract the real path so that
+# add_custom_command DEPENDS (which does not evaluate generator expressions)
+# and configure-time protoc -I flags both receive a usable filesystem path.
+if(VHAL_PROTO_DIR MATCHES ":([^>]+)>$")
+    set(VHAL_PROTO_DIR "${CMAKE_MATCH_1}")
+endif()
+message(STATUS "VHAL proto dir: ${VHAL_PROTO_DIR}")
+
+# ---------------------------------------------------------------------------
+# UI proto code generation — velan_ui.proto lives in proto/ in this repo.
+# Imports VoiceAssistantState.proto from the vhal-proto package (VHAL_PROTO_DIR).
+# Both proto files are compiled; the generated .pb.h files are co-located in
+# UI_PROTO_GEN_DIR so #include "VoiceAssistantState.pb.h" resolves at compile time.
 # ---------------------------------------------------------------------------
 set(UI_PROTO_DIR  "${CMAKE_SOURCE_DIR}/proto")
 set(UI_PROTO_GEN_DIR "${CMAKE_BINARY_DIR}/ui_proto_gen")
 file(MAKE_DIRECTORY "${UI_PROTO_GEN_DIR}")
 
+# VoiceAssistantState.proto — shared enum from the vhal-proto package
+add_custom_command(
+    OUTPUT
+        "${UI_PROTO_GEN_DIR}/VoiceAssistantState.pb.cc"
+        "${UI_PROTO_GEN_DIR}/VoiceAssistantState.pb.h"
+    COMMAND ${PROTOC_EXE}
+    ARGS
+        "--cpp_out=${UI_PROTO_GEN_DIR}"
+        "-I${VHAL_PROTO_DIR}"
+        ${PROTOC_INCLUDE_ARGS}
+        "${VHAL_PROTO_DIR}/VoiceAssistantState.proto"
+    DEPENDS "${VHAL_PROTO_DIR}/VoiceAssistantState.proto"
+    VERBATIM
+)
+
+# velan_ui.proto — VelanUIService definition; imports VoiceAssistantState.proto
 add_custom_command(
     OUTPUT
         "${UI_PROTO_GEN_DIR}/velan_ui.pb.cc"
@@ -166,13 +201,17 @@ add_custom_command(
         "--grpc_out=${UI_PROTO_GEN_DIR}"
         "--plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN_EXE}"
         "-I${UI_PROTO_DIR}"
+        "-I${VHAL_PROTO_DIR}"
         ${PROTOC_INCLUDE_ARGS}
         "${UI_PROTO_DIR}/velan_ui.proto"
-    DEPENDS "${UI_PROTO_DIR}/velan_ui.proto"
+    DEPENDS
+        "${UI_PROTO_DIR}/velan_ui.proto"
+        "${VHAL_PROTO_DIR}/VoiceAssistantState.proto"
     VERBATIM
 )
 
 add_library(velan_ui_proto STATIC
+    "${UI_PROTO_GEN_DIR}/VoiceAssistantState.pb.cc"
     "${UI_PROTO_GEN_DIR}/velan_ui.pb.cc"
     "${UI_PROTO_GEN_DIR}/velan_ui.grpc.pb.cc"
 )
@@ -187,10 +226,6 @@ target_link_libraries(velan_ui_proto PUBLIC
 # The package exposes an include dir containing VehicleServer.proto at the root
 # and android/hardware/automotive/vehicle/*.proto beneath it.
 # ---------------------------------------------------------------------------
-find_package(vhal-proto CONFIG REQUIRED)
-get_target_property(_vhal_incdirs vhal-proto::vhal-proto INTERFACE_INCLUDE_DIRECTORIES)
-list(GET _vhal_incdirs 0 VHAL_PROTO_DIR)
-message(STATUS "VHAL proto dir: ${VHAL_PROTO_DIR}")
 set(VHAL_PROTO_GEN_DIR "${CMAKE_BINARY_DIR}/vhal_proto_gen")
 file(MAKE_DIRECTORY "${VHAL_PROTO_GEN_DIR}")
 
