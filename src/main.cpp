@@ -50,6 +50,7 @@ static const char* DEFAULT_STT_MODEL      = "models/stt/ggml-medium.bin"; // Whi
 static const char* DEFAULT_TTS_MODEL      = "models/tts/en_US-lessac-medium.onnx"; // Piper
 static const char* DEFAULT_OLLAMA_MODEL   = "llama3.2:3b";
 static const char* DEFAULT_VHAL_SERVER    = "localhost:50051";
+static const char* DEFAULT_NOTIFY_SERVER  = "192.168.10.10:50051";  // RPi vhal-core
 static const char* DEFAULT_WAKEWORD_PHRASE = WWD_DEFAULT_WAKE_WORDS;
 static const char* DEFAULT_ENCODER_HEF    = "models/stt/whisper-tiny-h8l/encoder.hef";
 static const char* DEFAULT_DECODER_HEF    = "models/stt/whisper-tiny-h8l/decoder.hef";
@@ -66,14 +67,19 @@ static std::unique_ptr<TransformerManager> g_llm;
 static std::unique_ptr<Text2SpeechManager> g_tts;
 static std::unique_ptr<WakeWordDetector>   g_wwd;
 static std::unique_ptr<UIServer>           g_ui;
+static std::unique_ptr<vhal::VehicleServer::Stub> g_notify_stub;
 
 
-// Vendor-defined VHAL property for voice assistant trigger.
+// Vendor-defined VHAL properties for the voice assistant function.
 // Encoding: VehiclePropertyGroup::VENDOR (0x20000000)
 //         | VehicleArea::GLOBAL          (0x01000000)
-//         | VehiclePropertyType::INT32   (0x00400000)
-//         | unique id                    (0x0001)
-static const int32_t VOICE_ASSIST_TRIGGER = 0x21400001;
+//         | VehiclePropertyType::INT32   (0x00400000) or STRING (0x00100000)
+//         | unique id
+// Value semantics for VOICE_ASSIST_STATE: see velan/VoiceAssistantState.proto
+static const int32_t VOICE_ASSIST_TRIGGER    = 0x21400001;  // INT32
+static const int32_t VOICE_ASSIST_STATE      = 0x21400002;  // INT32  (VoiceAssistantState enum)
+static const int32_t VOICE_ASSIST_TRANSCRIPT = 0x21400003;  // STRING (user utterance, set on → THINKING)
+static const int32_t VOICE_ASSIST_RESPONSE   = 0x21400004;  // STRING (assistant reply, set on → TALKING)
 
 
 // ---------------------------------------------------------------------------
@@ -85,6 +91,7 @@ struct VelanConfigs {
     std::string ollama_model    = DEFAULT_OLLAMA_MODEL;
     std::string ollama_host     = "localhost";  // override with --llm <host> for remote Ollama
     std::string vhal_server     = DEFAULT_VHAL_SERVER;
+    std::string notify_server   = DEFAULT_NOTIFY_SERVER;  // target vhal-core for VOICE_ASSIST_STATE
     std::string wakeword_phrase = DEFAULT_WAKEWORD_PHRASE;
     std::string aicore          = "whisper";    // "whisper" | "hailo8"
     std::string encoder_hef     = DEFAULT_ENCODER_HEF;
@@ -184,6 +191,13 @@ static bool parse_cmdline(int argc, char* argv[], VelanConfigs& cfg) {
                 return false;
             }
             cfg.vhal_server = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "--notify") == 0) {
+            if ((i + 1) >= argc) {
+                std::cerr << "[Velan] Missing value for --notify\n";
+                return false;
+            }
+            cfg.notify_server = argv[++i];
         }
         else if (std::strcmp(argv[i], "--wwphrase") == 0) {
             if ((i + 1) >= argc) {
@@ -383,6 +397,27 @@ static std::vector<std::string> split_phrases(const std::string& s) {
 
 // ---------------------------------------------------------------------------
 // Run the LLM + TTS pipeline, then resume wake-word detection.
+// Write VOICE_ASSIST_STATE to the notify server (RPi vhal-core by default).
+// gRPC channels and stubs are thread-safe so this can be called from any thread.
+static void set_vhal_voice_state(velan::VoiceAssistantState state) {
+    if (!g_notify_stub) return;
+    vhal::VehiclePropValueRequests req;
+    auto* entry = req.add_requests();
+    entry->set_request_id(1);
+    entry->mutable_value()->set_prop(VOICE_ASSIST_STATE);
+    entry->mutable_value()->set_area_id(0);
+    entry->mutable_value()->add_int32_values(static_cast<int32_t>(state));
+
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(500));
+    vhal::SetValueResults results;
+    auto s = g_notify_stub->SetValues(&ctx, req, &results);
+    if (!s.ok()) {
+        std::cerr << log_ts() << "[Velan] VOICE_ASSIST_STATE notify failed: "
+                  << s.error_message() << "\n";
+    }
+}
+
 // Called by Speech2TextManager via the on_transcript callback after Whisper
 // finishes transcribing. Empty text means silence/error — still resumes WWD.
 // ---------------------------------------------------------------------------
@@ -392,9 +427,11 @@ static void chat_with_ai_model(const std::string& text) {
             try {
                 std::cout << log_ts() << "[Velan] Thinking...\n";
                 if (g_ui) g_ui->notify(velan::THINKING, text);
+                set_vhal_voice_state(velan::THINKING);
                 std::string reply = g_llm->chat(text);
                 std::cout << log_ts() << "[Velan] Assistant: " << reply << "\n\n";
                 if (g_ui) g_ui->notify(velan::TALKING, text, reply);
+                set_vhal_voice_state(velan::TALKING);
                 g_tts->speak(reply);
             } catch (const std::exception& e) {
                 std::cerr << log_ts() << "[Velan] Ollama error: " << e.what() << "\n";
@@ -405,6 +442,40 @@ static void chat_with_ai_model(const std::string& text) {
     }
     if (g_wwd) g_wwd->resume();     // PROCESSING → LISTENING
     if (g_ui)  g_ui->notify(velan::LISTENING);
+    set_vhal_voice_state(velan::LISTENING);
+}
+
+
+// ---------------------------------------------------------------------------
+// Config dump
+// ---------------------------------------------------------------------------
+static void print_config(const VelanConfigs& cfg) {
+    std::cout << log_ts() << "[Velan] ======== VelanConfigs ========\n";
+    std::cout << log_ts() << "[Velan] AI core        : " << cfg.aicore        << "\n";
+    if (cfg.aicore == "hailo8") {
+        std::cout << log_ts() << "[Velan] Encoder HEF    : " << cfg.encoder_hef  << "\n";
+        std::cout << log_ts() << "[Velan] Decoder HEF    : " << cfg.decoder_hef  << "\n";
+        std::cout << log_ts() << "[Velan] Vocab JSON     : " << cfg.vocab_json   << "\n";
+    } else {
+        std::cout << log_ts() << "[Velan] STT/WWD model  : " << cfg.stt_model    << "\n";
+    }
+    std::cout << log_ts() << "[Velan] TTS model      : " << cfg.tts_model      << "\n";
+    std::cout << log_ts() << "[Velan] LLM model      : " << cfg.ollama_model   << "\n";
+    std::cout << log_ts() << "[Velan] LLM host       : " << cfg.ollama_host    << "\n";
+    std::cout << log_ts() << "[Velan] VHAL server    : " << cfg.vhal_server    << "\n";
+    std::cout << log_ts() << "[Velan] Notify server  : " << cfg.notify_server  << "\n";
+    std::cout << log_ts() << "[Velan] Wake phrase    : " << cfg.wakeword_phrase << "\n";
+    if (cfg.mic_device < 0)
+        std::cout << log_ts() << "[Velan] Mic device     : system default\n";
+    else
+        std::cout << log_ts() << "[Velan] Mic device     : " << cfg.mic_device << "\n";
+    if (cfg.tts_sink.empty())
+        std::cout << log_ts() << "[Velan] TTS ALSA sink  : system default\n";
+    else
+        std::cout << log_ts() << "[Velan] TTS ALSA sink  : " << cfg.tts_sink << "\n";
+    std::cout << log_ts() << "[Velan] UI server port : "
+              << (cfg.ui_port.empty() || cfg.ui_port == "0" ? "disabled" : cfg.ui_port) << "\n";
+    std::cout << log_ts() << "[Velan] =====================================\n";
 }
 
 
@@ -427,31 +498,14 @@ int main(int argc, char* argv[]) {
     std::signal(SIGABRT, on_signal);
     std::signal(SIGHUP,  on_signal);   // SSH disconnect → clean exit
 
-    std::cout << log_ts() << "[Velan] ======== VelanConfigs ========\n";
-    std::cout << log_ts() << "[Velan] AI core        : " << cfg.aicore        << "\n";
-    if (cfg.aicore == "hailo8") {
-        std::cout << log_ts() << "[Velan] Encoder HEF    : " << cfg.encoder_hef  << "\n";
-        std::cout << log_ts() << "[Velan] Decoder HEF    : " << cfg.decoder_hef  << "\n";
-        std::cout << log_ts() << "[Velan] Vocab JSON     : " << cfg.vocab_json   << "\n";
-    } else {
-        std::cout << log_ts() << "[Velan] STT/WWD model  : " << cfg.stt_model    << "\n";
+    print_config(cfg);
+
+    // ---- Notify stub — writes VOICE_ASSIST_STATE to the target vhal-core ----
+    {
+        auto ch = grpc::CreateChannel(cfg.notify_server, grpc::InsecureChannelCredentials());
+        g_notify_stub = vhal::VehicleServer::NewStub(ch);
     }
-    std::cout << log_ts() << "[Velan] TTS model      : " << cfg.tts_model      << "\n";
-    std::cout << log_ts() << "[Velan] LLM model      : " << cfg.ollama_model   << "\n";
-    std::cout << log_ts() << "[Velan] LLM host       : " << cfg.ollama_host    << "\n";
-    std::cout << log_ts() << "[Velan] VHAL server    : " << cfg.vhal_server    << "\n";
-    std::cout << log_ts() << "[Velan] Wake phrase    : " << cfg.wakeword_phrase << "\n";
-    if (cfg.mic_device < 0)
-        std::cout << log_ts() << "[Velan] Mic device     : system default\n";
-    else
-        std::cout << log_ts() << "[Velan] Mic device     : " << cfg.mic_device << "\n";
-    if (cfg.tts_sink.empty())
-        std::cout << log_ts() << "[Velan] TTS ALSA sink  : system default\n";
-    else
-        std::cout << log_ts() << "[Velan] TTS ALSA sink  : " << cfg.tts_sink << "\n";
-    std::cout << log_ts() << "[Velan] UI server port : "
-              << (cfg.ui_port.empty() || cfg.ui_port == "0" ? "disabled" : cfg.ui_port) << "\n";
-    std::cout << log_ts() << "[Velan] =====================================\n";
+    set_vhal_voice_state(velan::IDLE);
 
     // ---- UI gRPC server (optional — disabled if --ui-port 0) ----
     if (!cfg.ui_port.empty() && cfg.ui_port != "0") {
@@ -516,6 +570,7 @@ int main(int argc, char* argv[]) {
             []() {                                          // LISTENING → RECORDING
                 if (g_wwd) g_wwd->pause();
                 if (g_ui)  g_ui->notify(velan::RECORDING);
+                set_vhal_voice_state(velan::RECORDING);
             },
             [](const std::string& text) { chat_with_ai_model(text);  },   // transcript → LLM → TTS → resume
             cfg.mic_device
@@ -537,6 +592,7 @@ int main(int argc, char* argv[]) {
         );
         g_wwd->start();
         if (g_ui) g_ui->notify(velan::LISTENING);
+        set_vhal_voice_state(velan::LISTENING);
     } catch (const std::exception& e) {
         std::cerr << "[Velan] Wake word detector failed to start: " << e.what() << "\n";
         std::cerr << "[Velan] Continuing with VHAL trigger only.\n";
@@ -617,6 +673,8 @@ int main(int argc, char* argv[]) {
         g_wwd->stop();   // sets running_=false, detaches detect_loop thread
         g_wwd.reset();   // ~WakeWordDetector: 200 ms drain + Pa_Terminate
     }
+    set_vhal_voice_state(velan::IDLE);   // return cluster-ui border to idle before exit
+    g_notify_stub.reset();
     g_ui.reset();        // gRPC Shutdown → WatchState exits → "Client disconnected"
                          // then server_thread_.join(); all UI output before Bye.
     g_tts.reset();
